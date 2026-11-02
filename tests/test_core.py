@@ -297,3 +297,29 @@ class CrewTests(unittest.TestCase):
 
         png = render_crew_png(RenderInput(view_for(crew()), "", TZ, NOW, {DAY: NOW}))
         self.assertTrue(png.startswith(b"\x89PNG"))
+        many = crew([dict(name=f"PERSON{i}, X", skills=[], cells="on") for i in range(12)])
+        png = render_crew_png(RenderInput(view_for(many), "", TZ, NOW, {DAY: NOW}))
+        self.assertTrue(png.startswith(b"\x89PNG"))  # overflow -> "+N more"
+
+    def test_freshness_stamps(self):
+        from custom_components.gartan_availability.core.render import MUTED, WARN, RenderInput, freshness
+
+        view = view_for(crew())
+        fresh = {DAY + timedelta(days=k): NOW - timedelta(minutes=2 if k == 0 else 50) for k in range(7)}
+        self.assertEqual(freshness(RenderInput(view, "", TZ, NOW, fresh)),
+                         [("Today 07:58", MUTED), ("Week 07:10", MUTED)])
+        stale = dict(fresh); stale[DAY] = NOW - timedelta(minutes=40); stale[DAY + timedelta(days=3)] = NOW - timedelta(hours=3)
+        self.assertEqual([c for _, c in freshness(RenderInput(view, "", TZ, NOW, stale))], [WARN, WARN])
+        self.assertEqual(freshness(RenderInput(view, "", TZ, NOW, {}))[1], ("Week -", WARN))
+
+    def test_callouts_png(self):
+        from custom_components.gartan_availability.core.history import CallOut
+        from custom_components.gartan_availability.core.render import RenderInput, render_callouts_png
+
+        cos = [CallOut("KT52P1", NOW - timedelta(hours=h), NOW - timedelta(hours=h) + timedelta(minutes=50), 4, h % 2 == 0)
+               for h in (3, 30, 80)]
+        png = render_callouts_png(RenderInput(view_for(crew()), "KT52P1", TZ, NOW, {DAY: NOW}, callouts=cos,
+                                              counts={"this_week": {"all": 1, "me": 0}}))
+        self.assertTrue(png.startswith(b"\x89PNG"))
+        empty = render_callouts_png(RenderInput(view_for(crew()), "KT52P1", TZ, NOW, {DAY: NOW}))
+        self.assertTrue(empty.startswith(b"\x89PNG"))

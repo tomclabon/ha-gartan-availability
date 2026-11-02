@@ -1,9 +1,9 @@
-"""Draw the week as a PNG (appliance + your availability). Needs Pillow only.
+"""Widget pictures (PNG). Needs Pillow only.
 
-Layout: a header (legend, then "Updated HH:MM", or the last data time in red if
-today's fetch is failing), an hour axis, then one row per local day. Each row has
-the day label with "Updated HH:MM" underneath, and one bar spanning 00:00-24:00
-coloured by the combination of appliance and you, with a white mark every hour.
+Sized for Android home-screen widgets, which scale the picture to fit:
+- week:      ~3.8:1, for a 4x1 widget
+- crew:      ~2.8:1, for a 3x1 widget
+- call-outs: square, for a 1x1 widget
 """
 from __future__ import annotations
 
@@ -39,6 +39,8 @@ class RenderInput:
     today_stale_after: timedelta = timedelta(minutes=15)
     day_stale_after: timedelta = timedelta(hours=2)
     days: int = 7
+    callouts: list = field(default_factory=list)  # history CallOut objects, any appliance
+    counts: dict = field(default_factory=dict)  # {period: {"all": n, "me": n}} for appliance
 
 
 def _font(size: int):
@@ -48,6 +50,57 @@ def _font(size: int):
         return ImageFont.load_default(size=size)  # scalable, bundled with Pillow >= 10.1
     except TypeError:
         return ImageFont.load_default()
+
+
+def _png(img) -> bytes:
+    buf = io.BytesIO()
+    img.save(buf, format="PNG", optimize=True)
+    return buf.getvalue()
+
+
+def _fit(d, text: str, font, room: float) -> str:
+    """Shorten text with an ellipsis to fit `room` pixels."""
+    if d.textlength(text, font=font) <= room:
+        return text
+    while text and d.textlength(text + "…", font=font) > room:
+        text = text[:-1]
+    return (text + "…") if text else ""
+
+
+def _hhmm(at: datetime, tz: tzinfo, today: date) -> str:
+    loc = at.astimezone(tz)
+    return f"{loc:%H:%M}" if loc.date() == today else f"{loc:%a %H:%M}"
+
+
+# ---------------------------------------------------------------------------
+# freshness: today's fetch, and the oldest fetch of the other days
+
+
+def freshness(inp: RenderInput) -> list[tuple[str, tuple[int, int, int]]]:
+    """[("Today 18:55", colour), ("Week 18:30", colour)]."""
+    today = inp.now.astimezone(inp.tz).date()
+    out = []
+    got = inp.fetched.get(today)
+    if got is None:
+        out.append(("Today -", WARN))
+    else:
+        stale = inp.now - got > inp.today_stale_after
+        out.append((f"Today {_hhmm(got, inp.tz, today)}", WARN if stale else MUTED))
+    others = [today + timedelta(days=k) for k in range(1, inp.days)]
+    times = [inp.fetched.get(d) for d in others]
+    if not others:
+        return out
+    if any(t is None for t in times):
+        out.append(("Week -", WARN))
+    else:
+        oldest = min(times)
+        stale = inp.now - oldest > inp.day_stale_after
+        out.append((f"Week {_hhmm(oldest, inp.tz, today)}", WARN if stale else MUTED))
+    return out
+
+
+# ---------------------------------------------------------------------------
+# week (4x1)
 
 
 def _day_slots(view: View, tz: tzinfo, first: date, days: int):
@@ -76,21 +129,16 @@ def slot_colour(app_status: str | None, me_on: bool) -> tuple[int, int, int]:
     return NO_DATA if app_status in (None, STATUS_UNKNOWN) else NOTHING
 
 
-def _stamp(at: datetime, tz: tzinfo, today: date) -> str:
-    loc = at.astimezone(tz)
-    return f"Updated {loc:%H:%M}" if loc.date() == today else f"Updated {loc:%a %H:%M}"
-
-
-def render_week_png(inp: RenderInput, width: int = 960) -> bytes:
+def render_week_png(inp: RenderInput, width: int = 1000) -> bytes:
     from PIL import Image, ImageDraw
 
-    scale = width / 960
-    px = lambda v: max(1, round(v * scale))  # noqa: E731
-    f_head, f_body, f_small, f_tiny = _font(px(26)), _font(px(24)), _font(px(19)), _font(px(12))
+    s = width / 1000
+    px = lambda v: max(1, round(v * s))  # noqa: E731
+    f_top, f_axis, f_day = _font(px(22)), _font(px(17)), _font(px(22))
 
-    pad, label_w = px(16), px(110)
-    header_h, axis_h, row_h, bar_h = px(48), px(24), px(52), px(36)
-    height = pad + header_h + axis_h + inp.days * row_h + pad
+    pad, label_w = px(8), px(70)
+    top_h, axis_h, row_h, bar_h = px(28), px(19), px(28), px(23)
+    height = pad + top_h + axis_h + inp.days * row_h + pad - (row_h - bar_h)
     img = Image.new("RGB", (width, height), BG)
     d = ImageDraw.Draw(img)
 
@@ -99,58 +147,40 @@ def render_week_png(inp: RenderInput, width: int = 960) -> bytes:
     me = view.timeline.series.get(view.me_key) if view.me_key else None
     now_loc = inp.now.astimezone(tz)
     first = now_loc.date()
-
-    # --- header: legend left, one timestamp right
-    x, y = pad + label_w, pad  # legend starts where the bars start
-    legend = ((APP_ONLY, inp.appliance), (ME_ONLY, "You"), (BOTH, "Both"), (OUT, "Out"))
-    for colour, label in legend:
-        d.rounded_rectangle((x, y + px(6), x + px(22), y + px(28)), radius=px(4), fill=colour)
-        x += px(30)
-        d.text((x, y + px(2)), label, font=f_head, fill=TEXT)
-        x += d.textlength(label, font=f_head) + px(22)
-    today_fetch = inp.fetched.get(first)
-    if today_fetch is None:
-        right, colour = "No data", WARN
-    elif inp.now - today_fetch > inp.today_stale_after:
-        right, colour = "Data " + _stamp(today_fetch, tz, first)[len("Updated "):], WARN
-    else:
-        right, colour = f"Updated {now_loc:%H:%M}", MUTED
-    tw = d.textlength(right, font=f_head)
-    d.text((width - pad - tw, y + px(2)), right, font=f_head, fill=colour)
-
-    # --- hour axis (milestones only)
     x0, x1 = pad + label_w, width - pad
     span = x1 - x0
     hx = lambda h: x0 + span * h / 24  # noqa: E731
-    ay = pad + header_h
+
+    # top bar: legend (aligned with the bars) left, freshness right
+    x, y = x0, pad
+    for colour, label in ((APP_ONLY, inp.appliance), (ME_ONLY, "You"), (BOTH, "Both"), (OUT, "Out")):
+        d.rounded_rectangle((x, y + px(4), x + px(16), y + px(20)), radius=px(3), fill=colour)
+        x += px(21)
+        d.text((x, y), label, font=f_top, fill=TEXT)
+        x += d.textlength(label, font=f_top) + px(14)
+    xr = width - pad
+    for text, colour in reversed(freshness(inp)):
+        w = d.textlength(text, font=f_top)
+        d.text((xr - w, y), text, font=f_top, fill=colour)
+        xr -= w + px(14)
+
+    # hour axis
+    ay = pad + top_h
     for h in (0, 6, 12, 18, 24):
         lbl = f"{h:02d}"
-        lw = d.textlength(lbl, font=f_small)
-        d.text((min(max(hx(h) - lw / 2, x0), x1 - lw), ay), lbl, font=f_small, fill=MUTED)
+        lw = d.textlength(lbl, font=f_axis)
+        d.text((min(max(hx(h) - lw / 2, x0), x1 - lw), ay - px(1)), lbl, font=f_axis, fill=MUTED)
 
-    # --- one combined bar per day
+    # one combined bar per day
     slots = _day_slots(view, tz, first, inp.days)
     top = ay + axis_h
     for r in range(inp.days):
         day = first + timedelta(days=r)
-        ry = top + r * row_h
-        d.text((pad, ry - px(1)), "Today" if r == 0 else f"{day:%a %d}", font=f_body,
-               fill=TEXT if r == 0 else MUTED)
-        got = inp.fetched.get(day)
-        if got is None:
-            stamp, stamp_colour = "No data", WARN
-        else:
-            limit = inp.today_stale_after if r == 0 else inp.day_stale_after
-            stamp = _stamp(got, tz, first)
-            stamp_colour = WARN if inp.now - got > limit else MUTED
-        d.text((pad, ry + px(25)), stamp, font=f_tiny, fill=stamp_colour)
-
-        by = ry
+        by = top + r * row_h
+        d.text((pad, by), "Today" if r == 0 else f"{day:%a}", font=f_day, fill=TEXT if r == 0 else MUTED)
         d.rectangle((x0, by, x1, by + bar_h), fill=NOTHING if day in slots else NO_DATA)
         for start_h, end_h, i in slots.get(day, []):
-            colour = slot_colour(
-                app.effective[i] if app else None, bool(me is not None and me.on[i])
-            )
+            colour = slot_colour(app.effective[i] if app else None, bool(me is not None and me.on[i]))
             if colour != NOTHING:
                 d.rectangle((hx(start_h), by, hx(end_h), by + bar_h), fill=colour)
         for h in range(1, 24):
@@ -160,15 +190,12 @@ def render_week_png(inp: RenderInput, width: int = 960) -> bytes:
             w = max(1, int(hx(nh) - x0))
             overlay = Image.new("RGBA", (w, bar_h + 1), BG + (150,))
             img.paste(overlay, (x0, by), overlay)
-            d.line((hx(nh), by - px(5), hx(nh), by + bar_h + px(5)), fill=NOW, width=px(3))
-
-    buf = io.BytesIO()
-    img.save(buf, format="PNG", optimize=True)
-    return buf.getvalue()
+            d.line((hx(nh), by - px(3), hx(nh), by + bar_h + px(3)), fill=NOW, width=px(3))
+    return _png(img)
 
 
 # ---------------------------------------------------------------------------
-# who is on / off now
+# crew (3x1): who is on now (until when), who is off (from when)
 
 
 def display_name(name: str, imported: bool) -> str:
@@ -199,96 +226,124 @@ def crew_rows(view: View, now: datetime) -> list[CrewRow]:
     rows: list[CrewRow] = []
     if i is None:
         return rows
-    end = tl.end
     for s in tl.series.values():
         on = s.on[i]
-        nxt_on, nxt_off, _ = next_on_off(runs_from_flags(tl, s.on), now, end)
+        nxt_on, nxt_off, _ = next_on_off(runs_from_flags(tl, s.on), now, tl.end)
         change = nxt_off if on else nxt_on
         rows.append(
-            CrewRow(
-                name=display_name(s.name, s.imported),
-                skills=sorted(s.skills),
-                me=s.key == view.me_key,
-                on=on,
-                change=change,
-                beyond=on and change is None,  # on until past the known week
-            )
+            CrewRow(display_name(s.name, s.imported), sorted(s.skills), s.key == view.me_key,
+                    on, change, on and change is None)
         )
     far = datetime.max.replace(tzinfo=now.tzinfo)
     rows.sort(key=lambda r: (r.change or far, r.name))
     return rows
 
 
-def _when(t: datetime | None, tz: tzinfo, today: date, on: bool) -> str:
+def _short_when(t: datetime | None, tz: tzinfo, today: date, on: bool) -> str:
     if t is None:
-        return "beyond week" if on else "not this week"
-    loc = t.astimezone(tz)
-    prefix = "until " if on else "from "
-    return prefix + (f"{loc:%H:%M}" if loc.date() == today else f"{loc:%a %H:%M}")
+        return "7d+" if on else "-"
+    return _hhmm(t, tz, today)
 
 
-def _header_stamp(inp: RenderInput, today: date):
-    fetched = inp.fetched.get(today)
-    now_loc = inp.now.astimezone(inp.tz)
-    if fetched is None:
-        return "No data", WARN
-    if inp.now - fetched > inp.today_stale_after:
-        return "Data " + _stamp(fetched, inp.tz, today)[len("Updated "):], WARN
-    return f"Updated {now_loc:%H:%M}", MUTED
-
-
-def render_crew_png(inp: RenderInput, width: int = 960) -> bytes:
+def render_crew_png(inp: RenderInput, width: int = 960, max_rows: int = 8) -> bytes:
     from PIL import Image, ImageDraw
 
-    scale = width / 960
-    px = lambda v: max(1, round(v * scale))  # noqa: E731
-    f_head, f_name, f_time, f_skill = _font(px(26)), _font(px(24)), _font(px(22)), _font(px(15))
+    s = width / 960
+    px = lambda v: max(1, round(v * s))  # noqa: E731
+    f_title, f_row, f_small = _font(px(27)), _font(px(27)), _font(px(20))
+
+    tz = inp.tz
+    today = inp.now.astimezone(tz).date()
+    rows = crew_rows(inp.view, inp.now)
+    columns = ([r for r in rows if r.on], [r for r in rows if not r.on])
+
+    pad, gap = px(10), px(22)
+    title_h, row_h = px(36), px(34)
+    height = pad + title_h + max_rows * row_h + pad
+    img = Image.new("RGB", (width, height), BG)
+    d = ImageDraw.Draw(img)
+    col_w = (width - 2 * pad - gap) / 2
+
+    stamp, stamp_colour = freshness(inp)[0]
+    for k, (title, chip, items) in enumerate(
+        ((f"On ({len(columns[0])})", BOTH, columns[0]), (f"Off ({len(columns[1])})", MUTED, columns[1]))
+    ):
+        cx = pad + k * (col_w + gap)
+        d.rounded_rectangle((cx, pad + px(7), cx + px(16), pad + px(23)), radius=px(3), fill=chip)
+        d.text((cx + px(22), pad), title, font=f_title, fill=TEXT)
+        if k == 1:
+            sw = d.textlength(stamp, font=f_small)
+            d.text((cx + col_w - sw, pad + px(5)), stamp, font=f_small, fill=stamp_colour)
+        d.line((cx, pad + title_h - px(5), cx + col_w, pad + title_h - px(5)), fill=NOTHING, width=px(2))
+        shown = items if len(items) <= max_rows else items[: max_rows - 1]
+        for j, r in enumerate(shown):
+            ry = pad + title_h + j * row_h
+            when = _short_when(r.change, tz, today, r.on)
+            soon = r.change is not None and r.change - inp.now <= timedelta(hours=1)
+            ww = d.textlength(when, font=f_row)
+            d.text((cx + col_w - ww, ry), when, font=f_row, fill=TEXT if soon else MUTED)
+            name = _fit(d, r.name.replace(" (import)", "*"), f_row, col_w - ww - px(12))
+            d.text((cx, ry), name, font=f_row,
+                   fill=ME_ONLY if r.me else (TEXT if r.on else MUTED))
+        if len(items) > max_rows:
+            ry = pad + title_h + (max_rows - 1) * row_h
+            d.text((cx, ry), f"+{len(items) - max_rows + 1} more", font=f_row, fill=MUTED)
+    return _png(img)
+
+
+# ---------------------------------------------------------------------------
+# call-outs (1x1): the last few for the appliance, with counts
+
+
+def render_callouts_png(inp: RenderInput, size: int = 400, max_rows: int = 5) -> bytes:
+    from PIL import Image, ImageDraw
+
+    s = size / 400
+    px = lambda v: max(1, round(v * s))  # noqa: E731
+    f_head, f_row, f_foot = _font(px(30)), _font(px(34)), _font(px(28))
 
     tz = inp.tz
     now_loc = inp.now.astimezone(tz)
     today = now_loc.date()
-    rows = crew_rows(inp.view, inp.now)
-    on_rows = [r for r in rows if r.on]
-    off_rows = [r for r in rows if not r.on]
+    items = [c for c in inp.callouts if c.appliance == inp.appliance and c.start <= inp.now]
+    items = sorted(items, key=lambda c: c.start, reverse=True)[:max_rows]
 
-    pad, col_gap = px(16), px(24)
-    title_h, row_h = px(40), px(38)
-    n = max(len(on_rows), len(off_rows), 1)
-    height = pad + title_h + n * row_h + pad
-    img = Image.new("RGB", (width, height), BG)
+    img = Image.new("RGB", (size, size), BG)
     d = ImageDraw.Draw(img)
+    pad = px(14)
 
-    # stamp: right-aligned on the title line, above the Off column
-    right, colour = _header_stamp(inp, today)
-    tw = d.textlength(right, font=f_time)
-    d.text((width - pad - tw, pad + px(4)), right, font=f_time, fill=colour)
+    stamp, stamp_colour = freshness(inp)[0]
+    head_colour = WARN if stamp_colour == WARN else MUTED
+    d.text((pad, pad), _fit(d, f"{inp.appliance} call-outs", f_head, size - 2 * pad), font=f_head,
+           fill=head_colour)
 
-    col_w = (width - 2 * pad - col_gap) / 2
-    columns = (
-        (pad, f"On now ({len(on_rows)})", BOTH, on_rows),
-        (pad + col_w + col_gap, f"Off now ({len(off_rows)})", MUTED, off_rows),
-    )
-    ty = pad
-    for cx, title, title_colour, items in columns:
-        d.rounded_rectangle((cx, ty + px(8), cx + px(18), ty + px(26)), radius=px(4), fill=title_colour)
-        d.text((cx + px(26), ty + px(2)), title, font=f_head, fill=TEXT)
-        d.line((cx, ty + title_h - px(6), cx + col_w, ty + title_h - px(6)), fill=NOTHING, width=px(2))
-        for k, r in enumerate(items):
-            ry = ty + title_h + k * row_h
-            when = _when(r.change, tz, today, r.on)
-            ww = d.textlength(when, font=f_time)
-            soon = r.change is not None and r.change - inp.now <= timedelta(hours=1)
-            d.text((cx + col_w - ww, ry + px(6)), when, font=f_time, fill=TEXT if soon else MUTED)
-            name_colour = ME_ONLY if r.me else (TEXT if r.on else MUTED)
-            d.text((cx, ry + px(4)), r.name, font=f_name, fill=name_colour)
-            nx = cx + d.textlength(r.name, font=f_name) + px(10)
-            skills = " ".join(r.skills)
-            room = cx + col_w - ww - px(12) - nx
-            if skills and room > px(30):
-                while skills and d.textlength(skills, font=f_skill) > room:
-                    skills = skills[: skills.rfind(" ")] if " " in skills else ""
-                d.text((nx, ry + px(12)), skills, font=f_skill, fill=MUTED)
+    y, row_h = pad + px(44), px(50)
+    if not items:
+        d.text((pad, y), "None yet", font=f_row, fill=MUTED)
+    for c in items:
+        loc = c.start.astimezone(tz)
+        if loc.date() == today:
+            when = f"Today {loc:%H:%M}"
+        elif loc.date() == today - timedelta(days=1):
+            when = f"Yest {loc:%H:%M}"
+        elif (today - loc.date()).days < 7:
+            when = f"{loc:%a %H:%M}"
+        else:
+            when = f"{loc:%d %b}"
+        live = c.end > inp.now
+        minutes = int((min(c.end, inp.now) - c.start).total_seconds() // 60)
+        dur = "now" if live else (f"{minutes // 60}h{minutes % 60:02d}" if minutes >= 60 else f"{minutes}m")
+        colour = OUT if live else (ME_ONLY if c.me else MUTED)
+        dw = d.textlength(dur, font=f_row)
+        d.text((size - pad - dw, y), dur, font=f_row, fill=colour)
+        d.text((pad, y), _fit(d, when, f_row, size - 2 * pad - dw - px(10)), font=f_row, fill=colour)
+        y += row_h
 
-    buf = io.BytesIO()
-    img.save(buf, format="PNG", optimize=True)
-    return buf.getvalue()
+    week = inp.counts.get("this_week", {})
+    month = inp.counts.get("last_4_weeks", {})
+    if week or month:
+        foot = f"Wk {week.get('all', 0)} ({week.get('me', 0)}) · 4wk {month.get('all', 0)} ({month.get('me', 0)})"
+        fy = size - pad - px(30)
+        d.line((pad, fy - px(8), size - pad, fy - px(8)), fill=NOTHING, width=px(2))
+        d.text((pad, fy), _fit(d, foot, f_foot, size - 2 * pad), font=f_foot, fill=MUTED)
+    return _png(img)

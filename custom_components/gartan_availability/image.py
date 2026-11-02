@@ -1,11 +1,11 @@
 """Pictures for the companion app's Picture widget (and dashboards).
 
-- image.gartan_availability_<appliance>_week: the week for an appliance and you
-- image.gartan_availability_crew: who is on now (until when) and off (from when)
+- image.gartan_availability_<appliance>_week: 7 days for an appliance and you (4x1)
+- image.gartan_availability_crew: who is on now (until) and off (from) (3x1)
+- image.gartan_availability_<appliance>_call_outs: recent call-outs and counts (1x1)
 
-Both are rendered fresh on every request, so their "Updated" stamp is the fetch
-time. image_last_updated changes on every data update and slot boundary, which
-tells dashboards to re-fetch.
+All are rendered fresh on every request. image_last_updated changes on every
+data update, slot boundary and history change, which tells dashboards to re-fetch.
 """
 from __future__ import annotations
 
@@ -20,12 +20,13 @@ from .entity import ApplianceEntity, GartanEntity
 async def async_setup_entry(hass, entry, async_add_entities) -> None:
     c = entry.runtime_data
     entities: list = [CrewImage(c)]
-    entities += [WeekImage(c, label) for label in selected_appliances(entry)]
+    for label in selected_appliances(entry):
+        entities += [WeekImage(c, label), CallOutsImage(c, label)]
     async_add_entities(entities)
 
 
 class _RenderedImage:
-    """Mixin: listed first so its update hook runs before CoordinatorEntity's."""
+    """Mixin: listed first so its hooks run before CoordinatorEntity's."""
 
     _attr_content_type = "image/png"
     _appliance = ""
@@ -34,10 +35,22 @@ class _RenderedImage:
         ImageEntity.__init__(self, coordinator.hass)
         self._attr_image_last_updated = dt_util.utcnow()
 
+    async def async_added_to_hass(self) -> None:
+        await super().async_added_to_hass()
+        self.async_on_remove(self.coordinator.history.async_add_listener(self._bump))
+
+    @callback
+    def _bump(self) -> None:
+        self._attr_image_last_updated = dt_util.utcnow()
+        self.async_write_ha_state()
+
     @callback
     def _handle_coordinator_update(self) -> None:
         self._attr_image_last_updated = dt_util.utcnow()
         super()._handle_coordinator_update()
+
+    def _extra(self, now) -> dict:
+        return {}
 
     @staticmethod
     def _render(inp) -> bytes:
@@ -49,14 +62,16 @@ class _RenderedImage:
             return None
         from .core.render import RenderInput
 
+        now = dt_util.utcnow()
         inp = RenderInput(
             view=view,
             appliance=self._appliance,
             tz=dt_util.get_default_time_zone(),
-            now=dt_util.utcnow(),
+            now=now,
             fetched=dict(self.coordinator.fetched_at),  # keyed by local date
             today_stale_after=self.coordinator.today_stale_after,
             day_stale_after=self.coordinator.day_stale_after,
+            **self._extra(now),
         )
         return await self.hass.async_add_executor_job(self._render, inp)
 
@@ -74,6 +89,36 @@ class WeekImage(_RenderedImage, ApplianceEntity, ImageEntity):
         from .core.render import render_week_png
 
         return render_week_png(inp)
+
+
+class CallOutsImage(_RenderedImage, ApplianceEntity, ImageEntity):
+    _attr_icon = "mdi:fire-truck"
+
+    def __init__(self, coordinator, label: str) -> None:
+        ApplianceEntity.__init__(self, coordinator, label, "call_outs_picture", "Call-outs")
+        self._appliance = label
+        self._init_image(coordinator)
+
+    @property
+    def available(self) -> bool:
+        return self.coordinator.last_update_success
+
+    def _extra(self, now) -> dict:
+        from .core.history import all_callouts, callout_counts
+
+        led = self.coordinator.history.ledger
+        callouts = all_callouts(led, self.coordinator.data, now)
+        tz = dt_util.get_default_time_zone()
+        return {
+            "callouts": callouts,
+            "counts": callout_counts(callouts, led, self._appliance, now, tz),
+        }
+
+    @staticmethod
+    def _render(inp) -> bytes:
+        from .core.render import render_callouts_png
+
+        return render_callouts_png(inp)
 
 
 class CrewImage(_RenderedImage, GartanEntity, ImageEntity):

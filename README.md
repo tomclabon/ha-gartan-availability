@@ -109,10 +109,19 @@ written to these statistics (`b<id>` is your brigade id):
 - Your employee id for the two-week view. It's normally read from the schedule,
   so only set it if `sensor.gartan_availability_history` says it's missing.
 
-## Home-screen widget
+## Home-screen widgets
 
-`image.gartan_availability_<appliance>_week` draws 7 rows (today plus 6 days), each
-a single bar across 00-24 with a faint grey mark every hour, coloured by slot:
+Three pictures, each shaped for an Android **Picture** widget (from the Home
+Assistant app). Set each widget's tap action to Refresh. The widget fetches its
+picture about hourly and on tap, and the picture is drawn fresh each time.
+
+**`image.gartan_availability_<appliance>_week`** (4x1)
+- 7 rows (today plus 6 days), each a single bar across 00-24 with a faint mark
+  every hour.
+- Today's past hours are dimmed and a white line marks now.
+- The top bar has the legend and two fetch times. **Today** is when today was last
+  fetched (every 5 minutes); **Week** is the oldest fetch of the other six days
+  (about hourly). Each turns red when stale (see Refresh settings).
 
 | Colour | Meaning |
 |---|---|
@@ -123,22 +132,18 @@ a single bar across 00-24 with a faint grey mark every hour, coloured by slot:
 | Dark grey | Neither |
 | Light grey | Appliance status unknown, or no data |
 
-Today's past hours are dimmed and a thick white line marks now. The header shows
-"Updated HH:MM", which is when the picture was drawn. If today's data hasn't been
-fetched for 15 minutes, it shows "Data HH:MM" in red instead. Under each day label,
-"Updated HH:MM" shows that day's last fetch. Today is refreshed every 5 minutes and
-the other days about hourly; a time turns red once it's over 15 minutes old for
-today or 2 hours old for other days.
+**`image.gartan_availability_crew`** (3x1)
+- Who is on now with the time they go off, and who is off with the time they come
+  on, each sorted by soonest change.
+- You're shown in amber, and imported rows are marked `*`. Changes within the hour
+  are in white.
+- `7d+` means on past the known week, and `-` means not on this week.
+- Up to 8 per column, then "+N more". Today's fetch time is at the top right.
 
-`image.gartan_availability_crew` lists who is on now with when they go off, and who
-is off with when they come on, each sorted by soonest change. You're shown in amber,
-imported rows are marked "(import)", skills are shown small after each name, and
-changes within the hour are highlighted. "beyond week" means on past the known
-7 days; "not this week" means not on at all in that time.
-
-On Android, add the Home Assistant app's **Picture** widget and pick that entity.
-The picture is drawn fresh each time it's fetched. The widget fetches about hourly
-and whenever you tap it (set the tap action to Refresh).
+**`image.gartan_availability_<appliance>_call_outs`** (1x1)
+- The last 5 call-outs with their start and duration. Yours (on call when it
+  started) are in amber, others in grey, and one in progress is pink ("now").
+- The footer shows counts as all (yours): `Wk 1 (0) · 4wk 6 (3)`.
 
 ## Notifications blueprint
 

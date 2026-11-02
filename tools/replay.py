@@ -17,10 +17,10 @@ from zoneinfo import ZoneInfo
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from custom_components.gartan.core.const import ON_STATUSES  # noqa: E402
-from custom_components.gartan.core.model import runs_from_flags  # noqa: E402
-from custom_components.gartan.core.parse import parse_day  # noqa: E402
-from custom_components.gartan.core.view import (  # noqa: E402
+from custom_components.gartan_availability.core.const import ON_STATUSES  # noqa: E402
+from custom_components.gartan_availability.core.model import runs_from_flags  # noqa: E402
+from custom_components.gartan_availability.core.parse import parse_day  # noqa: E402
+from custom_components.gartan_availability.core.view import (  # noqa: E402
     CoreConfig,
     build_view,
     people_on,

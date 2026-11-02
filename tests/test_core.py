@@ -2,10 +2,10 @@ import unittest
 from datetime import date, datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
-from custom_components.gartan.core import client
-from custom_components.gartan.core.model import build_timeline, next_on_off, runs_from_flags
-from custom_components.gartan.core.parse import classify_cell, parse_brigades, parse_day, parse_status
-from custom_components.gartan.core.view import (
+from custom_components.gartan_availability.core import client
+from custom_components.gartan_availability.core.model import build_timeline, next_on_off, runs_from_flags
+from custom_components.gartan_availability.core.parse import classify_cell, parse_brigades, parse_day, parse_status
+from custom_components.gartan_availability.core.view import (
     CoreConfig,
     appliance_labels,
     build_view,

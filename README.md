@@ -1,5 +1,8 @@
 # Gartan Availability (Home Assistant custom integration)
 
+For Gartan's **Availability** tool. Domain `gartan_availability`, so integrations for
+other Gartan tools can sit alongside it.
+
 Reads the Gartan availability schedule and exposes it to Home Assistant: a calendar
 per appliance, your own on-call calendar, current-state and next-change sensors, and
 a compact whole-week schedule for your own templates and automations.
@@ -14,7 +17,7 @@ Nothing station- or person-specific is built in:
 ## Install
 
 Via HACS: add this repository as a custom repository (type: integration), install,
-restart. Or copy `custom_components/gartan/` to `/config/custom_components/gartan/`
+restart. Or copy `custom_components/gartan_availability/` to `/config/custom_components/gartan_availability/`
 and restart.
 
 Then go to Settings > Devices & services > Add integration > Gartan Availability.
@@ -28,32 +31,32 @@ Setup asks for the Gartan site URL, username and password, then:
 Entity ids come from the device names. `<appliance>` is the Gartan row label in
 lower case, e.g. `kt52p1`. You can rename any entity in the UI.
 
-**Gartan** (station and you)
+**Gartan Availability** (station and you)
 
 | Entity | Meaning |
 |---|---|
-| `calendar.gartan_on_call` | Your on-call periods |
-| `binary_sensor.gartan_on_call` | You're on call now |
-| `sensor.gartan_next_on_call` / `sensor.gartan_next_off_call` | Timestamps |
-| `sensor.gartan_who_is_on` | Number of people on now; attribute `people` (name, imported, skills) |
-| `sensor.gartan_schedule` | The whole known week (see below) |
-| `binary_sensor.gartan_needs_attention` | Any issue (also raised in Settings > Repairs) |
-| `sensor.gartan_last_scrape` | Diagnostic |
+| `calendar.gartan_availability_on_call` | Your on-call periods |
+| `binary_sensor.gartan_availability_on_call` | You're on call now |
+| `sensor.gartan_availability_next_on_call` / `sensor.gartan_availability_next_off_call` | Timestamps |
+| `sensor.gartan_availability_who_is_on` | Number of people on now; attribute `people` (name, imported, skills) |
+| `sensor.gartan_availability_schedule` | The whole known week (see below) |
+| `binary_sensor.gartan_availability_needs_attention` | Any issue (also raised in Settings > Repairs) |
+| `sensor.gartan_availability_last_scrape` | Diagnostic |
 
-**Gartan `<APPLIANCE>`** (one device per selected appliance)
+**Gartan Availability `<APPLIANCE>`** (one device per selected appliance)
 
 | Entity | Meaning |
 |---|---|
-| `calendar.gartan_<appliance>` | On-the-run periods (Available or Alternate), plus "out on a call" |
-| `binary_sensor.gartan_<appliance>_on_the_run` | On the run now; attribute `status` |
-| `binary_sensor.gartan_<appliance>_deployed` | Out on a call (Off Station) now |
-| `sensor.gartan_<appliance>_next_on_the_run` / `_next_off_the_run` | Timestamps; unknown while out on a call |
+| `calendar.gartan_availability_<appliance>` | On-the-run periods (Available or Alternate), plus "out on a call" |
+| `binary_sensor.gartan_availability_<appliance>_on_the_run` | On the run now; attribute `status` |
+| `binary_sensor.gartan_availability_<appliance>_deployed` | Out on a call (Off Station) now |
+| `sensor.gartan_availability_<appliance>_next_on_the_run` / `_next_off_the_run` | Timestamps; unknown while out on a call |
 
 "Next off" timestamps are unknown when a run reaches the end of the known 7 days.
 
 ## Using the schedule sensor
 
-`sensor.gartan_schedule` has these attributes. They are excluded from the recorder,
+`sensor.gartan_availability_schedule` has these attributes. They are excluded from the recorder,
 so they don't bloat the database.
 
 ```yaml
@@ -77,14 +80,14 @@ legend:
 Slot `i` covers `start + i × 15 min`. The index for now:
 
 ```jinja
-{% set s = state_attr('sensor.gartan_schedule', 'start') | as_datetime %}
+{% set s = state_attr('sensor.gartan_availability_schedule', 'start') | as_datetime %}
 {% set i = ((now() - s).total_seconds() // 900) | int %}
 ```
 
 For example, the people on now who hold a given skill:
 
 ```jinja
-{{ state_attr('sensor.gartan_schedule', 'people')
+{{ state_attr('sensor.gartan_availability_schedule', 'people')
    | selectattr('slots', 'search', '^.{' ~ i ~ '}1')
    | selectattr('skills', 'contains', 'IC1')
    | map(attribute='name') | list }}
@@ -105,7 +108,7 @@ call-out (kept in `.storage`), so the export and calendars stay useful.
   Co-responder. "Bookable" means a blue-dash cell with no booking. Unknown booking
   codes count as not available and raise an issue.
 - For each new oddity, and for each call-out, a raw copy of the response is saved to
-  `/config/gartan_captures/` (max 20). They contain names, so don't share them as-is.
+  `/config/gartan_availability_captures/` (max 20). They contain names, so don't share them as-is.
 
 ## Tests
 

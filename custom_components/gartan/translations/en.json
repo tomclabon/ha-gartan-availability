@@ -3,18 +3,27 @@
     "step": {
       "user": {
         "title": "Gartan availability",
-        "description": "Your Gartan availability login and station details.",
+        "description": "Your Gartan site and login. The station is read from your account after logging in.",
         "data": {
+          "base_url": "Gartan site URL (e.g. https://gartanlive.example.org.uk)",
           "username": "Username",
-          "password": "Password",
-          "base_url": "Gartan base URL",
-          "brigade_id": "Brigade ID",
-          "brigade_name": "Brigade name",
-          "me": "Your row name (as shown in the schedule, e.g. SURNAME, I)",
-          "my_label": "Short name used for your entities",
-          "appliance": "Appliance row label in Gartan (e.g. KT52P1)",
-          "appliance_slug": "Appliance short name used for entity ids (e.g. 52p1)"
+          "password": "Password"
         }
+      },
+      "brigade": {
+        "title": "Station",
+        "description": "Your login can see more than one station. Which one?",
+        "data": { "brigade_id": "Station" }
+      },
+      "me": {
+        "title": "Which row is you?",
+        "description": "Your own row couldn't be detected automatically. Pick it from the schedule.",
+        "data": { "me": "Your row" }
+      },
+      "appliances": {
+        "title": "Appliances",
+        "description": "Create calendar and status entities for these appliances. Every appliance is included in the schedule sensor regardless.",
+        "data": { "appliances": "Appliances" }
       },
       "reauth_confirm": {
         "title": "Gartan login failed",
@@ -24,14 +33,17 @@
     },
     "error": {
       "invalid_auth": "Login rejected. Check the username and password.",
-      "cannot_connect": "Could not fetch the schedule. Check the base URL (and see the log).",
-      "no_schedule": "Logged in but no people were found in the schedule.",
-      "appliance_not_found": "That appliance row was not found in today's schedule.",
-      "me_not_found": "Your row was not found in today's schedule."
+      "cannot_connect": "Could not reach Gartan or read the schedule. Check the site URL (and see the log).",
+      "no_schedule": "Logged in, but the schedule had no people in it.",
+      "no_appliances": "Logged in, but the schedule had no appliance rows."
     },
     "abort": {
-      "already_configured": "This login is already configured.",
-      "reauth_successful": "Password updated."
+      "already_configured": "This login and station are already configured.",
+      "reauth_successful": "Password updated.",
+      "invalid_auth": "Login rejected.",
+      "cannot_connect": "Could not fetch the schedule for that station (see the log).",
+      "no_schedule": "The station's schedule had no people in it.",
+      "no_appliances": "The station's schedule had no appliance rows."
     }
   },
   "options": {
@@ -39,11 +51,8 @@
       "init": {
         "title": "Gartan options",
         "data": {
-          "me": "Your row name",
-          "appliance": "Appliance row label",
-          "dual_role_people": "Dual-role people (one per line, as shown, e.g. WARD, S)",
-          "display_names": "Display names (one per line: WALLIS, D = Danny)",
-          "what_if_skills": "What-if skills for you (space separated, e.g. ERD/Ang)"
+          "appliances": "Appliances with their own entities",
+          "me": "Your row name (leave blank to detect automatically)"
         }
       }
     }

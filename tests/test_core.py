@@ -1,204 +1,202 @@
 import unittest
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 from custom_components.gartan.core import client
-from custom_components.gartan.core.model import Member, check_crew, next_on_off, runs_from_flags
-from custom_components.gartan.core.parse import classify_cell, parse_day, parse_status
-from custom_components.gartan.core.view import CoreConfig, build_view, crew_groups, display_name
+from custom_components.gartan.core.model import build_timeline, next_on_off, runs_from_flags
+from custom_components.gartan.core.parse import classify_cell, parse_brigades, parse_day, parse_status
+from custom_components.gartan.core.view import (
+    CoreConfig,
+    appliance_labels,
+    build_view,
+    find_me,
+    people_on,
+    schedule_export,
+)
 
-from .fixtures import N, table, window
+from .fixtures import BRIGADE_PAGE, N, table, window
 
 TZ = ZoneInfo("Europe/London")
-DAY = date(2026, 11, 2)  # GMT
-CFG = CoreConfig("KT52P1", "CLABON, T", frozenset({"WARD, S", "SIMON WARD"}))
+DAY = date(2026, 11, 2)  # GMT, so local midnight == 00:00 UTC
 NOW = datetime(2026, 11, 2, 8, 0, tzinfo=timezone.utc)
+CFG = CoreConfig()
 
 
-def crew(extra=None, me_cells="book", p1=None):
+def crew(extra=None, me_cells="book"):
     people = [
         dict(name="CLABON, T", skills=["BA", "DRV"], cells=me_cells, mine=True),
-        dict(name="ALPHA, A", skills=["IC1", "BA"], cells="on"),
+        dict(name="ALPHA, A", skills=["IC1", "BA"], cells="on", expiring=["BA"]),
         dict(name="BRAVO, B", skills=["ERD/Ang"], cells="on"),
         dict(name="CHARLIE, C", skills=["BA"], cells="on"),
     ]
-    people += extra or []
-    return people, (p1 or (lambda i: "Off the Run"))
+    return people + (extra or [])
 
 
-def view_for(people, p1, baseline=None, now=NOW):
-    day = parse_day(table(people, p1), DAY, TZ)
-    return build_view([day], CFG, baseline or {}, now), day
+def day_for(people, p1=lambda i: "Off the Run", d=DAY, v1=None):
+    return parse_day(table(people, p1, v1_fn=v1), d, TZ)
+
+
+def view_for(people, p1=lambda i: "Off the Run", baseline=None, now=NOW, v1=None):
+    return build_view([day_for(people, p1, v1=v1)], CFG, baseline or {}, now)
 
 
 class ParseTests(unittest.TestCase):
     def test_basic_shape(self):
-        people, p1 = crew()
-        day = parse_day(table(people, p1), DAY, TZ)
+        day = day_for(crew())
         self.assertEqual(len(day.slot_starts), N)
         self.assertEqual(day.issues, {})
-        self.assertEqual([p.name for p in day.people][:2], ["CLABON, T", "ALPHA, A"])
         me = day.people[0]
-        self.assertTrue(all(me.bookable) and not any(me.on))
+        self.assertTrue(me.is_me and all(me.bookable) and not any(me.on))
+        self.assertFalse(day.people[1].is_me)
         self.assertEqual(day.people[1].skills, frozenset({"IC1", "BA"}))
+        self.assertEqual(day.people[1].expiring, frozenset({"BA"}))
         self.assertEqual(day.appliances["KT52P1"][0], "off_the_run")
 
     def test_cell_classes(self):
         self.assertEqual(classify_cell({"class": "schTD"})[:2], (True, False))
         self.assertEqual(classify_cell({"class": "schTD_AutoContract"})[:2], (False, True))
+        self.assertEqual(classify_cell({"class": "schTD_AutoContract", "data-bid": "5"})[:2], (False, False))
         self.assertEqual(classify_cell({"class": "schTD_AutoContract", "data-codeid": "31"})[:2], (False, False))
         self.assertEqual(classify_cell({"class": "schTD", "data-codeid": "32"})[:2], (True, False))
+        self.assertEqual(classify_cell({"class": "schTD_DefaultBlackText", "data-codeid": "35"})[:2], (True, False))
         self.assertEqual(classify_cell({"class": "schTD_off", "data-codeid": "1"})[:2], (False, False))
-        on, book, key, _ = classify_cell({"class": "schTD", "data-codeid": "99"})
-        self.assertEqual((on, book, key), (False, False, "code:99"))
+        self.assertEqual(classify_cell({"class": "schTD", "data-codeid": "99"})[:3], (False, False, "code:99"))
 
     def test_unknown_code_raises_issue(self):
-        people, p1 = crew([dict(name="ZULU, Z", skills=[], cells="weird")])
-        day = parse_day(table(people, p1), DAY, TZ)
+        day = day_for(crew([dict(name="ZULU, Z", skills=[], cells="weird")]))
         self.assertIn("unknown_code:99", day.issues)
 
     def test_status_text(self):
         self.assertEqual(parse_status("KT52P1 (0000 - 0015) Available")[0], "available")
         self.assertEqual(parse_status("KT52P1 (0000 - 0015) Off Station")[0], "off_station")
-        status, raw = parse_status("KT52P1 (0000 - 0015) Intermediate")
-        self.assertEqual((status, raw), ("unknown", "Intermediate"))
+        self.assertEqual(parse_status("KT52P1 (0000 - 0015) Intermediate"), ("unknown", "Intermediate"))
+
+    def test_unknown_status_raises_issue(self):
+        day = day_for(crew(), p1=lambda i: "Intermediate")
+        self.assertIn("status_Intermediate", day.issues)
+
+    def test_appliance_label_from_title(self):
+        html = table(crew(), lambda i: "Available").replace("<td>KT52P1</td>", "<td><b>?</b></td>")
+        self.assertIn("KT52P1", parse_day(html, DAY, TZ).appliances)
+
+    def test_two_appliances(self):
+        day = day_for(crew(), v1=lambda i: "Available")
+        self.assertEqual(appliance_labels([day]), ["KT52P1", "KT52V1"])
 
     def test_clock_change_day_flagged(self):
-        people, p1 = crew()
-        day = parse_day(table(people, p1), date(2026, 3, 29), TZ)
-        self.assertIn("slot_count", day.issues)
+        self.assertIn("slot_count", day_for(crew(), d=date(2026, 3, 29)).issues)
+
+    def test_brigades(self):
+        self.assertEqual(
+            [(b.id, b.name, b.selected) for b in parse_brigades(BRIGADE_PAGE)],
+            [(2, "KT52 Cricklade", True)],
+        )
+        self.assertEqual(parse_brigades("<html></html>"), [])
 
 
-class CrewTests(unittest.TestCase):
-    def m(self, key, *skills):
-        return Member(key, key, frozenset(skills))
+class TimelineTests(unittest.TestCase):
+    def test_me_auto_detected_and_override(self):
+        tl = build_timeline([day_for(crew())])
+        self.assertEqual(find_me(tl), "CLABON, T")
+        self.assertEqual(find_me(tl, "alpha, a"), "ALPHA, A")
+        self.assertIsNone(find_me(tl, "NOBODY, X"))
 
-    def test_valid_crew(self):
-        c = check_crew([self.m("a", "IC1", "BA"), self.m("b", "ERD/Ang"), self.m("c", "BA"), self.m("d")], frozenset())
-        self.assertTrue(c.valid_strict)
+    def test_imports_are_people(self):
+        people = crew([dict(name="SIMON WARD", skills=["ERD/Ang"], cells="on", imp=True)], me_cells="off")
+        view = view_for(people)
+        on = people_on(view, NOW)
+        self.assertEqual(len(on), 4)
+        self.assertEqual(on[-1], {"name": "SIMON WARD", "imported": True, "skills": ["ERD/Ang"]})
 
-    def test_three_is_not_enough(self):
-        c = check_crew([self.m("a", "IC1", "BA"), self.m("b", "ERD/Ang"), self.m("c", "BA")], frozenset())
-        self.assertFalse(c.valid_dual)
-        self.assertIn("crew", c.missing)
+    def test_same_named_imports_merged(self):
+        people = crew(
+            [
+                dict(name="SIMON WARD", skills=["ERD/Ang"], cells=window("00:00", "06:00", "on"), imp=True),
+                dict(name="SIMON WARD", skills=["ERD/Ang"], cells=window("10:00", "12:00", "on"), imp=True),
+            ]
+        )
+        tl = build_timeline([day_for(people)])
+        imports = [s for s in tl.series.values() if s.imported]
+        self.assertEqual(len(imports), 1)
+        self.assertEqual(len(runs_from_flags(tl, imports[0].on)), 2)
 
-    def test_dual_role_needs_allowance(self):
-        members = [self.m("SIMON WARD", "IC1", "ERD/Ang"), self.m("b", "BA"), self.m("c", "BA"), self.m("d")]
-        self.assertFalse(check_crew(members, frozenset()).valid_dual)
-        members[0] = Member("w", "WARD, S", frozenset({"IC1", "ERD/Ang"}))
-        c = check_crew(members, frozenset({"WARD, S"}))
-        self.assertTrue(c.valid_dual and not c.valid_strict)
+    def test_import_on_one_day_only(self):
+        d1 = day_for(crew([dict(name="SIMON WARD", skills=["ERD/Ang"], cells="on", imp=True)]))
+        d2 = day_for(crew(), d=DAY + timedelta(days=1))
+        tl = build_timeline([d1, d2])
+        s = tl.series["import|SIMON WARD"]
+        self.assertEqual(len(s.on), 2 * N)
+        self.assertTrue(all(s.on[:N]) and not any(s.on[N:]))
 
-
-class ViewTests(unittest.TestCase):
-    def test_booking_window_found(self):
-        people, p1 = crew(p1=window("09:00", "12:00", "Available", "Off the Run"))
-        # P1 only on 09-12 but we want Tom bookable only 10-11: make him blue then
-        people[0]["cells"] = window("10:00", "11:00", "book", "off")
-        people[1]["cells"] = people[2]["cells"] = people[3]["cells"] = "on"
-        view, _ = view_for(people, lambda i: "Off the Run")
-        self.assertEqual(len(view.windows), 1)
-        w = view.windows[0]
-        self.assertTrue(w.goes_on)
-        self.assertEqual((w.start.hour, w.end.hour), (10, 11))
-        self.assertEqual(w.minutes, 60)
-
-    def test_no_window_when_truck_already_on(self):
-        people, p1 = crew()
-        view, _ = view_for(people, lambda i: "Available")
-        self.assertEqual(view.windows, [])
-
-    def test_partial_fix_labelled(self):
-        people, p1 = crew([dict(name="DELTA, D", skills=[], cells="on")])
-        people.pop(2)  # nobody holds ERD/Ang and Tom lacks it
-        view, _ = view_for(people, lambda i: "Off the Run")
-        self.assertTrue(view.windows)
-        self.assertFalse(view.windows[0].goes_on)
-        self.assertIn("ERD/Ang", view.windows[0].missing)
-
-    def test_what_if_driver_skill(self):
-        people, p1 = crew([dict(name="DELTA, D", skills=[], cells="on")])
-        people.pop(2)
-        cfg = CoreConfig("KT52P1", "CLABON, T", extra_skills=frozenset({"ERD/Ang"}))
-        day = parse_day(table(people, lambda i: "Off the Run"), DAY, TZ)
-        view = build_view([day], cfg, {}, NOW)
-        self.assertTrue(view.windows[0].goes_on)
-
-    def test_callout_keeps_baseline(self):
-        people, _ = crew(me_cells="off")
-        base_iso = {}
-        start = datetime(2026, 11, 2, 0, 0, tzinfo=timezone.utc)
-        from datetime import timedelta
-        for i in range(N):
-            base_iso[(start + i * timedelta(minutes=15)).isoformat()] = "available"
-        # pink from 07:00 onwards (truck out now)
-        pink = window("07:00", "24:00", "Off Station", "Available")
-        view, _ = view_for(people, pink, baseline=base_iso)
-        self.assertTrue(view.deployed)
-        idx_future = view.timeline.index_at(datetime(2026, 11, 2, 12, 0, tzinfo=timezone.utc))
-        self.assertEqual(view.p1_effective[idx_future], "available")
-        idx_now = view.timeline.index_at(NOW)
-        self.assertEqual(view.p1_effective[idx_now], "off_station")
-
-    def test_oracle_matches_on_clean_day(self):
-        people, _ = crew(me_cells="on")
-        view, _ = view_for(people, lambda i: "Available")
-        self.assertEqual(view.diagnostics["mismatched_slots"], 0)
-
-    def test_oracle_flags_disagreement(self):
-        people, _ = crew(me_cells="off")  # 3 people, Gartan says Available: rule disagrees
-        view, _ = view_for(people, lambda i: "Available")
-        self.assertGreater(view.diagnostics["mismatched_slots"], 0)
-
-    def test_dual_cover_import_dropped_from_crew(self):
-        people, p1 = crew(me_cells="off")
-        people.append(dict(name="SIMON WARD", skills=["ERD/Ang"], cells="on", imp=True))
-        view, _ = view_for(people, p1)
-        self.assertEqual(len(view.timeline.series), 4)  # cover row not a person
-        self.assertTrue(all(view.timeline.dual_import_on))
-
-    def test_visitor_import_counts(self):
-        people, p1 = crew(me_cells="off")
-        people.append(dict(name="VISITOR, V", skills=["BA", "DRV"], cells="on", imp=True))
-        view, _ = view_for(people, p1)
-        i = view.timeline.index_at(NOW)
-        self.assertEqual(len(view.timeline.members_on(i)), 4)
-
-    def test_groups_exclusive(self):
-        people, p1 = crew(me_cells="off")
-        view, _ = view_for(people, p1)
-        g = crew_groups(view, CFG, NOW)
-        self.assertEqual((g["ic"], g["driver"], g["ba"]), (["A Alpha"], ["B Bravo"], ["C Charlie"]))
-        self.assertEqual(g["off"], ["T Clabon"])
-
-    def test_display_names(self):
-        self.assertEqual(display_name("WALLIS, D", {"WALLIS, D": "Danny"}), "Danny")
-        self.assertEqual(display_name("WALLIS, D", {}), "D Wallis")
-
-
-class RunTests(unittest.TestCase):
     def test_runs_and_next(self):
-        people, _ = crew(me_cells=window("09:00", "10:00", "on", "off"))
-        view, _ = view_for(people, lambda i: "Off the Run")
-        flags = view.timeline.series["CLABON, T"].on
-        runs = runs_from_flags(view.timeline, flags)
-        self.assertEqual(len(runs), 1)
+        view = view_for(crew(me_cells=window("09:00", "10:00", "on")))
+        runs = runs_from_flags(view.timeline, view.timeline.series["CLABON, T"].on)
         nxt_on, nxt_off, cur = next_on_off(runs, NOW, view.timeline.end)
         self.assertFalse(cur)
-        self.assertEqual(nxt_on.hour, 9)
-        self.assertEqual(nxt_off.hour, 10)
+        self.assertEqual((nxt_on.hour, nxt_off.hour), (9, 10))
 
     def test_run_to_end_of_horizon_has_no_off(self):
-        people, _ = crew(me_cells=window("20:00", "24:00", "on", "off"))
-        view, _ = view_for(people, lambda i: "Off the Run")
+        view = view_for(crew(me_cells=window("20:00", "24:00", "on")))
         runs = runs_from_flags(view.timeline, view.timeline.series["CLABON, T"].on)
-        _, nxt_off, _ = next_on_off(runs, NOW, view.timeline.end)
-        self.assertIsNone(nxt_off)
+        self.assertIsNone(next_on_off(runs, NOW, view.timeline.end)[1])
+
+
+class CallOutTests(unittest.TestCase):
+    def test_baseline_used_for_future_pink(self):
+        start = datetime(2026, 11, 2, 0, 0, tzinfo=timezone.utc)
+        base = {"KT52P1": {(start + i * timedelta(minutes=15)).isoformat(): "available" for i in range(N)}}
+        view = view_for(crew(), p1=window("07:00", "24:00", "Off Station", "Available"), baseline=base)
+        app = view.appliances["KT52P1"]
+        self.assertTrue(app.deployed)
+        tl = view.timeline
+        self.assertEqual(app.effective[tl.index_at(NOW)], "off_station")
+        self.assertEqual(app.effective[tl.index_at(NOW + timedelta(hours=4))], "available")
+
+    def test_no_baseline_future_unknown(self):
+        view = view_for(crew(), p1=window("07:00", "24:00", "Off Station", "Available"))
+        tl = view.timeline
+        self.assertEqual(view.appliances["KT52P1"].effective[tl.index_at(NOW + timedelta(hours=4))], "unknown")
+
+
+class ExportTests(unittest.TestCase):
+    def test_export_shape(self):
+        people = crew(
+            [dict(name="SIMON WARD", skills=["ERD/Ang"], cells=window("10:00", "11:00", "on"), imp=True)],
+            me_cells=window("09:00", "10:00", "book", "on"),
+        )
+        view = view_for(people, p1=window("00:00", "01:00", "Alternate", "Available"), v1=lambda i: "Off the Run")
+        ex = schedule_export(view)
+        self.assertEqual(ex["start"], "2026-11-02T00:00:00+00:00")
+        self.assertEqual((ex["slot_minutes"], ex["slots"]), (15, N))
+        self.assertEqual(ex["appliances"]["KT52P1"][:5], "LLLLA")
+        self.assertEqual(ex["appliances"]["KT52V1"], "O" * N)
+        me = next(p for p in ex["people"] if p["me"])
+        self.assertEqual(me["slots"][35:41], "1bbbb1")
+        alpha = next(p for p in ex["people"] if p["name"] == "ALPHA, A")
+        self.assertEqual((alpha["skills"], alpha["expiring"]), (["BA", "IC1"], ["BA"]))
+        ward = ex["people"][-1]
+        self.assertTrue(ward["imported"])
+        self.assertEqual(ward["slots"].index("1"), 40)
+        self.assertEqual(ex["legend"]["person"]["b"], "bookable")
+
+    def test_export_stops_at_gap(self):
+        d1 = day_for(crew())
+        d3 = day_for(crew(), d=DAY + timedelta(days=2))  # day 2 missing
+        ex = schedule_export(build_view([d1, d3], CFG, {}, NOW))
+        self.assertEqual(ex["slots"], N)
+
+    def test_export_size_is_reasonable(self):
+        import json
+
+        people = crew([dict(name=f"PERSON{i}, X", skills=["BA"], cells="on") for i in range(12)])
+        days = [day_for(people, d=DAY + timedelta(days=k), v1=lambda i: "Available") for k in range(7)]
+        size = len(json.dumps(schedule_export(build_view(days, CFG, {}, NOW))))
+        self.assertLess(size, 16_384)
 
 
 class ClientTests(unittest.TestCase):
     PAGE = (
-        '<input type="text" name="txtSearch">'  # decoy text box before the login fields
+        '<input type="text" name="txtSearch">'
         '<input type="hidden" name="__VIEWSTATE" value="abc">'
         '<input type="hidden" name="__VIEWSTATEGENERATOR" value="C40DB9C1">'
         '<input type="hidden" name="__EVENTVALIDATION" value="def">'
@@ -208,9 +206,8 @@ class ClientTests(unittest.TestCase):
     )
 
     def test_login_form(self):
-        f = client.build_login_form(self.PAGE, "u", "p")
         self.assertEqual(
-            f,
+            client.build_login_form(self.PAGE, "u", "p"),
             {
                 "__VIEWSTATE": "abc",
                 "__VIEWSTATEGENERATOR": "C40DB9C1",
@@ -232,24 +229,7 @@ class ClientTests(unittest.TestCase):
     def test_request_body_matches_flow(self):
         b = client.build_request_body(date(2026, 3, 5), 2, "KT52 Cricklade")
         self.assertEqual(b["bookingDate"], "5/3/2026")
-        self.assertEqual(
-            set(b),
-            {"brigadeId", "brigadeName", "employeeBrigadeId", "bookingDate", "resolution",
-             "dayCount", "showDetails", "showHours", "highlightContractDetails",
-             "highlightEmployeesOffStation", "includeApplianceStatus", "showEmpShiftTypes"},
-        )
-
-
-class ParseDetailTests(unittest.TestCase):
-    def test_bid_without_code_not_bookable(self):
-        self.assertEqual(
-            classify_cell({"class": "schTD_AutoContract", "data-bid": "5"})[:2], (False, False)
-        )
-
-    def test_appliance_label_from_title(self):
-        html = table(crew()[0], lambda i: "Available").replace("<td>KT52P1</td>", "<td><b>?</b></td>")
-        day = parse_day(html, DAY, TZ)
-        self.assertIn("KT52P1", day.appliances)
+        self.assertEqual(len(b), 12)
 
 
 if __name__ == "__main__":

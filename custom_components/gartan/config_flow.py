@@ -1,111 +1,192 @@
-"""Config, reauth and options flows."""
+"""Config, reauth and options flows.
+
+Setup asks only for the site URL and login. The station comes from the schedule
+page's station list, your own row is detected (the only one with editable cells),
+and appliances are chosen from the rows Gartan returns.
+"""
 from __future__ import annotations
 
 from typing import Any
 
 import voluptuous as vol
+from aiohttp import DummyCookieJar
 from homeassistant import config_entries
 from homeassistant.core import HomeAssistant, callback
-from aiohttp import DummyCookieJar
 from homeassistant.helpers.aiohttp_client import async_create_clientsession
-from homeassistant.helpers.selector import TextSelector, TextSelectorConfig, TextSelectorType
+from homeassistant.helpers.selector import (
+    SelectOptionDict,
+    SelectSelector,
+    SelectSelectorConfig,
+    SelectSelectorMode,
+    TextSelector,
+    TextSelectorConfig,
+    TextSelectorType,
+)
 from homeassistant.util import dt as dt_util
 
 from .const import (
-    CONF_APPLIANCE,
+    CONF_APPLIANCES,
     CONF_BASE_URL,
     CONF_BRIGADE_ID,
     CONF_BRIGADE_NAME,
-    CONF_DISPLAY_NAMES,
-    CONF_DUAL_ROLE,
     CONF_ME,
-    CONF_MY_LABEL,
-    CONF_SLUG,
-    CONF_WHAT_IF,
-    DEFAULT_APPLIANCE,
-    DEFAULT_BASE_URL,
-    DEFAULT_BRIGADE_ID,
-    DEFAULT_BRIGADE_NAME,
-    DEFAULT_DUAL_ROLE,
-    DEFAULT_ME,
-    DEFAULT_MY_LABEL,
-    DEFAULT_SLUG,
     DOMAIN,
 )
 from .core.client import AuthError, FetchError, GartanClient
 from .core.model import build_timeline
-from .core.parse import find_appliance, parse_day
-from .core.view import find_me
+from .core.parse import Brigade, DaySchedule, parse_day
+from .core.view import appliance_labels, find_me
 
-MULTILINE = TextSelector(TextSelectorConfig(multiline=True))
 PASSWORD = TextSelector(TextSelectorConfig(type=TextSelectorType.PASSWORD))
+URL = TextSelector(TextSelectorConfig(type=TextSelectorType.URL))
 
 
-async def _validate(hass: HomeAssistant, data: dict[str, Any]) -> str | None:
-    """Return an error key, or None if the settings work."""
-    session = async_create_clientsession(hass, cookie_jar=DummyCookieJar(), auto_cleanup=False)
-    try:
-        return await _validate_with(hass, session, data)
-    finally:
-        await session.close()
+def _select(options, multiple: bool = False, custom: bool = False) -> SelectSelector:
+    return SelectSelector(
+        SelectSelectorConfig(
+            options=options,
+            multiple=multiple,
+            custom_value=custom,
+            mode=SelectSelectorMode.LIST if multiple else SelectSelectorMode.DROPDOWN,
+        )
+    )
 
 
-async def _validate_with(hass: HomeAssistant, session, data: dict[str, Any]) -> str | None:
-    client = GartanClient(
+class _Session:
+    """A cookie-less session for the duration of one flow step."""
+
+    def __init__(self, hass: HomeAssistant) -> None:
+        self.session = async_create_clientsession(
+            hass, cookie_jar=DummyCookieJar(), auto_cleanup=False
+        )
+
+    async def __aenter__(self):
+        return self.session
+
+    async def __aexit__(self, *exc):
+        await self.session.close()
+
+
+def _client(session, data: dict[str, Any]) -> GartanClient:
+    return GartanClient(
         session,
         data[CONF_BASE_URL],
         data["username"],
         data["password"],
-        data[CONF_BRIGADE_ID],
-        data[CONF_BRIGADE_NAME],
+        data.get(CONF_BRIGADE_ID),
+        data.get(CONF_BRIGADE_NAME),
     )
-    tz = dt_util.get_default_time_zone()
-    today = dt_util.now().date()
-    try:
-        html = await client.fetch_day(today)
-    except AuthError:
-        return "invalid_auth"
-    except FetchError:
-        return "cannot_connect"
-    day = parse_day(html, today, tz)
+
+
+async def _brigades(hass, data) -> tuple[str | None, list[Brigade]]:
+    async with _Session(hass) as session:
+        try:
+            return None, await _client(session, data).fetch_brigades()
+        except AuthError:
+            return "invalid_auth", []
+        except FetchError:
+            return "cannot_connect", []
+
+
+async def _today(hass, data) -> tuple[str | None, DaySchedule | None]:
+    async with _Session(hass) as session:
+        try:
+            html = await _client(session, data).fetch_day(dt_util.now().date())
+        except AuthError:
+            return "invalid_auth", None
+        except FetchError:
+            return "cannot_connect", None
+    day = await hass.async_add_executor_job(
+        parse_day, html, dt_util.now().date(), dt_util.get_default_time_zone()
+    )
     if not day.people:
-        return "no_schedule"
-    if find_appliance(day.appliances, data[CONF_APPLIANCE]) is None:
-        return "appliance_not_found"
-    if find_me(build_timeline([day], data[CONF_APPLIANCE]), data[CONF_ME]) is None:
-        return "me_not_found"
-    return None
+        return "no_schedule", None
+    if not day.appliances:
+        return "no_appliances", None
+    return None, day
 
 
 class GartanConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
     VERSION = 1
 
+    def __init__(self) -> None:
+        self._data: dict[str, Any] = {}
+        self._brigade_list: list[Brigade] = []
+        self._day: DaySchedule | None = None
+
     async def async_step_user(self, user_input=None):
         errors: dict[str, str] = {}
         if user_input is not None:
-            err = await _validate(self.hass, user_input)
+            data = {**user_input, CONF_BASE_URL: user_input[CONF_BASE_URL].rstrip("/")}
+            err, brigades = await _brigades(self.hass, data)
             if err is None:
-                await self.async_set_unique_id(
-                    f"{user_input[CONF_BASE_URL]}|{user_input['username']}".lower()
-                )
-                self._abort_if_unique_id_configured()
-                return self.async_create_entry(title="Gartan", data=user_input)
+                self._data, self._brigade_list = data, brigades
+                if len(brigades) == 1:
+                    return await self._use_brigade(brigades[0])
+                return await self.async_step_brigade()
             errors["base"] = err
         d = user_input or {}
         schema = vol.Schema(
             {
+                vol.Required(CONF_BASE_URL, default=d.get(CONF_BASE_URL, "https://")): URL,
                 vol.Required("username", default=d.get("username", "")): str,
                 vol.Required("password"): PASSWORD,
-                vol.Required(CONF_BASE_URL, default=d.get(CONF_BASE_URL, DEFAULT_BASE_URL)): str,
-                vol.Required(CONF_BRIGADE_ID, default=d.get(CONF_BRIGADE_ID, DEFAULT_BRIGADE_ID)): int,
-                vol.Required(CONF_BRIGADE_NAME, default=d.get(CONF_BRIGADE_NAME, DEFAULT_BRIGADE_NAME)): str,
-                vol.Required(CONF_ME, default=d.get(CONF_ME, DEFAULT_ME)): str,
-                vol.Required(CONF_MY_LABEL, default=d.get(CONF_MY_LABEL, DEFAULT_MY_LABEL)): str,
-                vol.Required(CONF_APPLIANCE, default=d.get(CONF_APPLIANCE, DEFAULT_APPLIANCE)): str,
-                vol.Required(CONF_SLUG, default=d.get(CONF_SLUG, DEFAULT_SLUG)): str,
             }
         )
         return self.async_show_form(step_id="user", data_schema=schema, errors=errors)
+
+    async def async_step_brigade(self, user_input=None):
+        """Only shown when the login can see more than one station."""
+        if user_input is not None:
+            chosen = next(
+                b for b in self._brigade_list if str(b.id) == user_input[CONF_BRIGADE_ID]
+            )
+            return await self._use_brigade(chosen)
+        options = [SelectOptionDict(value=str(b.id), label=b.name) for b in self._brigade_list]
+        default = next((str(b.id) for b in self._brigade_list if b.selected), vol.UNDEFINED)
+        return self.async_show_form(
+            step_id="brigade",
+            data_schema=vol.Schema(
+                {vol.Required(CONF_BRIGADE_ID, default=default): _select(options)}
+            ),
+        )
+
+    async def _use_brigade(self, brigade: Brigade):
+        self._data[CONF_BRIGADE_ID] = brigade.id
+        self._data[CONF_BRIGADE_NAME] = brigade.name
+        await self.async_set_unique_id(
+            f"{self._data[CONF_BASE_URL]}|{self._data['username']}|{brigade.id}".lower()
+        )
+        self._abort_if_unique_id_configured()
+        err, day = await _today(self.hass, self._data)
+        if err is not None:
+            return self.async_abort(reason=err)
+        self._day = day
+        if find_me(build_timeline([day])) is None:
+            return await self.async_step_me()
+        return await self.async_step_appliances()
+
+    async def async_step_me(self, user_input=None):
+        """Only shown if your own row could not be detected automatically."""
+        if user_input is not None:
+            self._data[CONF_ME] = user_input[CONF_ME]
+            return await self.async_step_appliances()
+        names = sorted({p.name for p in self._day.people if not p.is_import})
+        return self.async_show_form(
+            step_id="me", data_schema=vol.Schema({vol.Required(CONF_ME): _select(names)})
+        )
+
+    async def async_step_appliances(self, user_input=None):
+        labels = appliance_labels([self._day])
+        if user_input is not None:
+            data = {**self._data, CONF_APPLIANCES: user_input[CONF_APPLIANCES]}
+            return self.async_create_entry(title=f"Gartan {data[CONF_BRIGADE_NAME]}", data=data)
+        return self.async_show_form(
+            step_id="appliances",
+            data_schema=vol.Schema(
+                {vol.Required(CONF_APPLIANCES, default=labels): _select(labels, multiple=True)}
+            ),
+        )
 
     async def async_step_reauth(self, entry_data):
         return await self.async_step_reauth_confirm()
@@ -115,7 +196,7 @@ class GartanConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         entry = self._get_reauth_entry()
         if user_input is not None:
             data = {**entry.data, "password": user_input["password"]}
-            err = await _validate(self.hass, data)
+            err, _ = await _today(self.hass, data)
             if err is None:
                 return self.async_update_reload_and_abort(entry, data=data)
             errors["base"] = err
@@ -135,18 +216,22 @@ class GartanOptionsFlow(config_entries.OptionsFlow):
     async def async_step_init(self, user_input=None):
         entry = self.config_entry
 
-        def cur(key, default=""):
+        def cur(key, default=None):
             return entry.options.get(key, entry.data.get(key, default))
 
         if user_input is not None:
             return self.async_create_entry(data=user_input)
+        coordinator = getattr(entry, "runtime_data", None)
+        labels = list(getattr(coordinator, "known_appliances", []) or [])
+        for label in cur(CONF_APPLIANCES, []) or []:
+            if label not in labels:
+                labels.append(label)
         schema = vol.Schema(
             {
-                vol.Required(CONF_ME, default=cur(CONF_ME, DEFAULT_ME)): str,
-                vol.Required(CONF_APPLIANCE, default=cur(CONF_APPLIANCE, DEFAULT_APPLIANCE)): str,
-                vol.Optional(CONF_DUAL_ROLE, default=cur(CONF_DUAL_ROLE, DEFAULT_DUAL_ROLE)): MULTILINE,
-                vol.Optional(CONF_DISPLAY_NAMES, default=cur(CONF_DISPLAY_NAMES)): MULTILINE,
-                vol.Optional(CONF_WHAT_IF, default=cur(CONF_WHAT_IF)): str,
+                vol.Required(CONF_APPLIANCES, default=cur(CONF_APPLIANCES, [])): _select(
+                    labels, multiple=True
+                ),
+                vol.Optional(CONF_ME, description={"suggested_value": cur(CONF_ME, "")}): str,
             }
         )
         return self.async_show_form(step_id="init", data_schema=schema)

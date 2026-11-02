@@ -1,218 +1,178 @@
-"""Derived view of the schedule: effective P1 status, booking windows, diagnostics."""
+"""Derived view: effective appliance status (call-out handling), your row, and the
+raw schedule export. No station-specific crewing rules live here."""
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime
 from typing import Iterable
 
 from .const import (
-    BA_SKILL,
-    DRIVER_SKILL,
-    IC_SKILL,
     ON_STATUSES,
+    PERSON_BOOKABLE,
+    PERSON_OFF,
+    PERSON_ON,
     SLOT,
+    STATUS_CHAR,
     STATUS_OFF_STATION,
     STATUS_UNKNOWN,
 )
-from .model import Member, Timeline, build_timeline, check_crew
-from .parse import DaySchedule, find_appliance
+from .model import Timeline, build_timeline
+from .parse import DaySchedule
 
 
 @dataclass(frozen=True)
 class CoreConfig:
-    appliance_label: str
-    my_name: str  # data-name of the user's own row
-    dual_names: frozenset[str] = frozenset()  # upper-cased data-names
-    extra_skills: frozenset[str] = frozenset()  # "what-if" skills for me
-    display_names: dict[str, str] = field(default_factory=dict)  # UPPER name -> label
+    my_name: str = ""  # override; empty = auto-detect the logged-in user's row
 
 
 @dataclass
-class Window:
-    start: datetime
-    end: datetime
-    goes_on: bool  # True: truck goes on if you book; False: still short
-    needs_dual_role: bool
-    fills: list[str]
-    missing: list[str]
-
-    @property
-    def minutes(self) -> int:
-        return int((self.end - self.start).total_seconds() // 60)
+class ApplianceView:
+    label: str
+    raw: list[str]
+    effective: list[str]
+    deployed: bool
 
 
 @dataclass
 class View:
     timeline: Timeline
-    p1_effective: list[str]
-    baseline: dict[str, str]
-    deployed: bool
-    p1_now: str
+    appliances: dict[str, ApplianceView]
+    baseline: dict[str, dict[str, str]]  # label -> {slot iso: status}
     me_key: str | None
     issues: dict[str, str]
-    windows: list[Window]
-    diagnostics: dict
     generated: datetime
 
 
-def display_name(name: str, overrides: dict[str, str], visitor: bool = False) -> str:
-    label = overrides.get(name.upper())
-    if not label:
-        if "," in name:
-            surname, initials = (s.strip() for s in name.split(",", 1))
-            label = f"{initials} {surname.title()}"
-        else:
-            label = name.title()
-    return f"{label} (visiting)" if visitor else label
+def find_me(tl: Timeline, my_name: str = "") -> str | None:
+    """The logged-in user's row (the only one with editable cells), unless a
+    name override is given."""
+    crew = [s for s in tl.series.values() if not s.imported]
+    if my_name:
+        return next((s.key for s in crew if s.name.upper() == my_name.upper()), None)
+    mine = [s.key for s in crew if s.is_me]
+    return mine[0] if len(mine) == 1 else None
 
 
-def find_me(tl: Timeline, my_name: str) -> str | None:
-    for s in tl.series.values():
-        if not s.visitor and s.name.upper() == my_name.upper():
-            return s.key
-    return None
+def appliance_labels(days: Iterable[DaySchedule]) -> list[str]:
+    seen: dict[str, None] = {}
+    for d in days:
+        for label in d.appliances:
+            seen.setdefault(label, None)
+    return list(seen)
 
 
-def effective_p1(
-    tl: Timeline, baseline: dict[str, str], now: datetime
+def effective_status(
+    tl: Timeline, raw: list[str], baseline: dict[str, str], now: datetime
 ) -> tuple[list[str], dict[str, str], bool]:
-    """While the truck is out every future P1 slot is shown pink (off station).
-    Keep the pre-call-out schedule for those slots instead of the pink."""
+    """While an appliance is out, Gartan shows every future slot as Off Station.
+    For those future slots, use the last schedule seen before the call-out."""
     cur = tl.index_at(now)
     cur_start = tl.starts[cur] if cur is not None else now
     eff: list[str] = []
     new: dict[str, str] = {}
-    for s, raw in zip(tl.starts, tl.p1_raw):
+    for s, status in zip(tl.starts, raw):
         iso = s.isoformat()
-        if raw == STATUS_OFF_STATION:
-            if s <= now:
-                eff.append(STATUS_OFF_STATION)
-            else:
-                eff.append(baseline.get(iso, STATUS_UNKNOWN))
+        if status == STATUS_OFF_STATION:
+            eff.append(STATUS_OFF_STATION if s <= now else baseline.get(iso, STATUS_UNKNOWN))
             if iso in baseline and s >= cur_start:
                 new[iso] = baseline[iso]
         else:
-            eff.append(raw)
+            eff.append(status)
             if s >= cur_start:
-                new[iso] = raw
+                new[iso] = status
     deployed = cur is not None and eff[cur] == STATUS_OFF_STATION
     return eff, new, deployed
 
 
-def find_windows(
-    tl: Timeline, p1_eff: list[str], me_key: str, cfg: CoreConfig, now: datetime
-) -> list[Window]:
-    me = tl.series[me_key]
-    cur = tl.index_at(now)
-    first = cur if cur is not None else 0
-    out: list[Window] = []
-    cur_w: Window | None = None
-    sig = None
-    for i in range(first, len(tl.starts)):
-        qualifies = (
-            p1_eff[i] not in ON_STATUSES
-            and p1_eff[i] not in (STATUS_OFF_STATION, STATUS_UNKNOWN)
-            and me.bookable[i]
-        )
-        w = None
-        if qualifies:
-            others = tl.members_on(i, exclude=me_key)
-            c0 = check_crew(others, cfg.dual_names)
-            if not c0.valid_dual:
-                mine = Member(me.key, me.name, me.skills[i] | cfg.extra_skills)
-                c1 = check_crew([*others, mine], cfg.dual_names)
-                fills = sorted(set(c0.missing) - set(c1.missing))
-                if c1.valid_strict:
-                    w = (True, False, fills, [])
-                elif c1.valid_dual:
-                    w = (True, True, fills, [])
-                else:
-                    w = (False, False, fills, c1.missing)
-        if w is None:
-            cur_w, sig = None, None
-            continue
-        key = (w[0], w[1], tuple(w[2]), tuple(w[3]))
-        s, e = tl.starts[i], tl.starts[i] + SLOT
-        if cur_w is not None and sig == key and cur_w.end == s:
-            cur_w.end = e
-        else:
-            cur_w = Window(s, e, w[0], w[1], w[2], w[3])
-            sig = key
-            out.append(cur_w)
-    return out
-
-
-def compare_p1(tl: Timeline, p1_eff: list[str], cfg: CoreConfig) -> dict:
-    """Oracle: does our crew rule reproduce Gartan's appliance row?"""
-    checked, bad = 0, []
-    for i, st in enumerate(p1_eff):
-        if st in (STATUS_OFF_STATION, STATUS_UNKNOWN):
-            continue
-        chk = check_crew(tl.members_on(i), cfg.dual_names)
-        expected = chk.valid_strict or (chk.valid_dual and tl.dual_import_on[i])
-        checked += 1
-        if expected != (st in ON_STATUSES):
-            bad.append((tl.starts[i], expected, st))
-    return {
-        "checked_slots": checked,
-        "mismatched_slots": len(bad),
-        "mismatch_examples": [
-            {"start": s.isoformat(), "rule_says_on": e, "gartan": g} for s, e, g in bad[:6]
-        ],
-    }
-
-
 def build_view(
-    days: Iterable[DaySchedule], cfg: CoreConfig, baseline: dict[str, str], now: datetime
+    days: Iterable[DaySchedule],
+    cfg: CoreConfig,
+    baseline: dict[str, dict[str, str]],
+    now: datetime,
 ) -> View:
     days = list(days)
-    tl = build_timeline(days, cfg.appliance_label)
+    tl = build_timeline(days)
     issues: dict[str, str] = {}
     for d in days:
         issues.update(d.issues)
-    if days and not any(find_appliance(d.appliances, cfg.appliance_label) for d in days):
-        issues["appliance_missing"] = f"Appliance row {cfg.appliance_label!r} not found"
     me_key = find_me(tl, cfg.my_name)
     if days and me_key is None:
-        issues["me_missing"] = f"Your row {cfg.my_name!r} not found in the schedule"
-    eff, new_base, deployed = effective_p1(tl, baseline, now)
-    cur = tl.index_at(now)
-    p1_now = eff[cur] if cur is not None else STATUS_UNKNOWN
-    windows = find_windows(tl, eff, me_key, cfg, now) if me_key else []
-    diag = compare_p1(tl, eff, cfg)
-    diag["dual_cover_slots"] = sum(tl.dual_import_on)
-    return View(tl, eff, new_base, deployed, p1_now, me_key, issues, windows, diag, now)
+        issues["me_missing"] = (
+            f"Your row {cfg.my_name!r} not found in the schedule"
+            if cfg.my_name
+            else "Could not identify your own row in the schedule (set it in options)"
+        )
+    apps: dict[str, ApplianceView] = {}
+    new_base: dict[str, dict[str, str]] = {}
+    for label, raw in tl.appliances.items():
+        eff, nb, deployed = effective_status(tl, raw, baseline.get(label, {}), now)
+        apps[label] = ApplianceView(label, raw, eff, deployed)
+        new_base[label] = nb
+    return View(tl, apps, new_base, me_key, issues, now)
 
 
-def crew_groups(view: View, cfg: CoreConfig, now: datetime) -> dict[str, list[str]]:
-    """IC / Driver / BA (exclusive of IC+Driver) / Others, plus Off."""
+def contiguous_slots(tl: Timeline) -> int:
+    """Number of leading slots with no gaps (a missing day would break the
+    slot-index -> time mapping of the schedule export)."""
+    for i in range(1, len(tl.starts)):
+        if tl.starts[i] - tl.starts[i - 1] != SLOT:
+            return i
+    return len(tl.starts)
+
+
+def schedule_export(view: View) -> dict:
+    """Compact whole-week schedule for downstream templates.
+
+    Slot i covers start + i*15min. Appliances: one status char per slot.
+    People: one char per slot ("1" on, "0" off, "b" bookable)."""
     tl = view.timeline
-    i = tl.index_at(now)
-    empty = {"ic": [], "driver": [], "ba": [], "others": [], "off": [], "visiting": []}
-    if i is None:
-        return empty
-    ic, drv, ba, oth, off, vis = [], [], [], [], [], []
-    on_keys = set()
-    for m in tl.members_on(i):
-        on_keys.add(m.key)
-        label = display_name(m.name, cfg.display_names, m.visitor)
-        has_ic, has_drv = IC_SKILL in m.skills, DRIVER_SKILL in m.skills
-        if m.visitor:
-            vis.append(label)
-        if has_ic:
-            ic.append(label)
-        if has_drv:
-            drv.append(label)
-        if not has_ic and not has_drv:
-            (ba if BA_SKILL in m.skills else oth).append(label)
-    for s in tl.series.values():
-        if not s.visitor and s.key not in on_keys:
-            off.append(display_name(s.name, cfg.display_names))
+    n = contiguous_slots(tl)
+    if n == 0:
+        return {"start": None, "slot_minutes": 15, "slots": 0, "appliances": {}, "people": []}
+
+    def person_chars(s) -> str:
+        return "".join(
+            PERSON_ON if s.on[i] else PERSON_BOOKABLE if s.bookable[i] else PERSON_OFF
+            for i in range(n)
+        )
+
+    people = []
+    for s in sorted(tl.series.values(), key=lambda s: (s.imported, s.name)):
+        people.append(
+            {
+                "name": s.name,
+                "me": s.key == view.me_key,
+                "imported": s.imported,
+                "skills": sorted(s.skills),
+                "expiring": sorted(s.expiring),
+                "slots": person_chars(s),
+            }
+        )
     return {
-        "ic": sorted(ic),
-        "driver": sorted(drv),
-        "ba": sorted(ba),
-        "others": sorted(oth),
-        "off": sorted(off),
-        "visiting": sorted(vis),
+        "start": tl.starts[0].isoformat(),
+        "slot_minutes": int(SLOT.total_seconds() // 60),
+        "slots": n,
+        "appliances": {
+            label: "".join(STATUS_CHAR[st] for st in a.effective[:n])
+            for label, a in view.appliances.items()
+        },
+        "people": people,
+        "legend": {
+            "appliance": {v: k for k, v in STATUS_CHAR.items()},
+            "person": {PERSON_ON: "on", PERSON_OFF: "off", PERSON_BOOKABLE: "bookable"},
+        },
     }
+
+
+def people_on(view: View, now: datetime) -> list[dict]:
+    i = view.timeline.index_at(now)
+    if i is None:
+        return []
+    return [
+        {"name": s.name, "imported": s.imported, "skills": sorted(s.skills)}
+        for s in sorted(view.timeline.on_at(i), key=lambda s: (s.imported, s.name))
+    ]
+
+
+def is_on_the_run(status: str) -> bool:
+    return status in ON_STATUSES

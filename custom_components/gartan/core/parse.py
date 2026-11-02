@@ -1,26 +1,23 @@
-"""Parse Gartan GetSchedule HTML into plain data. Stdlib only."""
+"""Parse Gartan HTML (schedule table, brigade list) into plain data. Stdlib only."""
 from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
-from datetime import date, datetime, time, timedelta, tzinfo, timezone
+from datetime import date, datetime, time, timedelta, timezone, tzinfo
 from html.parser import HTMLParser
 
-from .const import (
-    CODES_OFF,
-    CODES_ON,
-    DRIVER_SKILL,
-    SLOT,
-    STATUS_BY_TEXT,
-    STATUS_UNKNOWN,
-)
+from .const import CODES_OFF, CODES_ON, SLOT, STATUS_BY_TEXT, STATUS_UNKNOWN
+
+
+# ---------------------------------------------------------------------------
+# generic table reader
 
 
 @dataclass
 class Cell:
     attrs: dict[str, str]
-    text: str
-    parts: list[str] = field(default_factory=list)
+    text: str = ""
+    parts: list[tuple[str, str]] = field(default_factory=list)  # (text, font colour)
 
 
 @dataclass
@@ -30,14 +27,16 @@ class Row:
 
 
 class _TableParser(HTMLParser):
-    """Collects <tr>/<td> with lower-cased attribute names and cell text."""
+    """Collects <tr>/<td> (lower-cased attribute names), cell text, and the font
+    colour each piece of text was written in."""
 
     def __init__(self) -> None:
         super().__init__(convert_charrefs=True)
         self.rows: list[Row] = []
         self._row: Row | None = None
         self._cell: Cell | None = None
-        self._text: list[str] = []
+        self._parts: list[tuple[str, str]] = []
+        self._fonts: list[str] = []
         self._skip = 0
 
     def handle_starttag(self, tag, attrs):
@@ -51,12 +50,16 @@ class _TableParser(HTMLParser):
             self._row = Row(a)
         elif tag == "td" and self._row is not None:
             self._close_cell()
-            self._cell = Cell(a, "")
-            self._text = []
+            self._cell = Cell(a)
+        elif tag == "font":
+            self._fonts.append(a.get("color", "").strip().lower())
 
     def handle_endtag(self, tag):
         if tag in ("script", "style"):
             self._skip = max(0, self._skip - 1)
+        elif tag == "font":
+            if self._fonts:
+                self._fonts.pop()
         elif tag == "td":
             self._close_cell()
         elif tag == "tr":
@@ -65,17 +68,20 @@ class _TableParser(HTMLParser):
 
     def handle_data(self, data):
         if not self._skip and self._cell is not None:
-            self._text.append(data)
+            self._parts.append((data, self._fonts[-1] if self._fonts else ""))
 
     def _close_cell(self):
         if self._cell is not None and self._row is not None:
-            self._cell.text = "".join(self._text).replace("\xa0", " ").strip()
+            self._cell.text = "".join(t for t, _ in self._parts).replace("\xa0", " ").strip()
             self._cell.parts = [
-                t.replace("\xa0", " ").strip() for t in self._text if t.strip()
+                (t.replace("\xa0", " ").strip(), colour)
+                for t, colour in self._parts
+                if t.strip()
             ]
             self._row.cells.append(self._cell)
         self._cell = None
-        self._text = []
+        self._parts = []
+        self._fonts = []
 
     def _close_row(self):
         if self._row is not None:
@@ -83,14 +89,20 @@ class _TableParser(HTMLParser):
         self._row = None
 
 
+# ---------------------------------------------------------------------------
+# schedule
+
+
 @dataclass
 class PersonDay:
-    name: str  # data-name, e.g. "SURNAME, I" (imports: free text)
+    name: str  # data-name: "SURNAME, I" for crew, free text for imports
     role: str
     skills: frozenset[str]
+    expiring: frozenset[str]  # skills shown in red
     is_import: bool
     on: list[bool]
     bookable: list[bool]
+    is_me: bool = False  # the logged-in user's row: its cells have "emp_" ids
 
 
 @dataclass
@@ -102,9 +114,14 @@ class DaySchedule:
     issues: dict[str, str] = field(default_factory=dict)  # key -> detail
 
 
-_PERSON_ID = re.compile(r"^emp(?:RO)?_(\d+)-(\d+)$")
+_PERSON_ID = re.compile(r"^emp(RO)?_(\d+)-(\d+)$")
 _APP_ID = re.compile(r"^app_(\d+)_(\d+)$")
 _STATUS_TEXT = re.compile(r"\)\s*(.+?)\s*$")
+
+
+def _is_red(colour: str) -> bool:
+    c = colour.lstrip("#").lower()
+    return c in ("red", "ff0000", "f00")
 
 
 def classify_cell(attrs: dict[str, str]) -> tuple[bool, bool, str | None, str | None]:
@@ -178,27 +195,33 @@ def parse_day(html: str, day: date, tz: tzinfo) -> DaySchedule:
         if statuses:
             app_rows[label or (row.cells[0].text if row.cells else "")] = statuses
 
-    # gather cells + skills per person, and the slot count
-    gathered = []
     n = max((max(s) + 1 for s in app_rows.values()), default=0)
+    gathered = []
     for row, is_import in raw_people:
         cells: dict[int, Cell] = {}
-        skill_tokens: list[str] = []
+        skills: list[str] = []
+        expiring: list[str] = []
+        editable = False
         for c in row.cells:
             m = _PERSON_ID.match(c.attrs.get("id", ""))
             if m:
-                cells[int(m.group(2))] = c
+                cells[int(m.group(3))] = c
+                editable = editable or m.group(1) is None
             elif "skillCol" in c.attrs.get("class", ""):
-                skill_tokens = [tok for part in c.parts for tok in part.split()]
+                for text, colour in c.parts:
+                    for tok in text.split():
+                        skills.append(tok)
+                        if _is_red(colour):
+                            expiring.append(tok)
         if cells:
             n = max(n, max(cells) + 1)
         role = row.cells[0].attrs.get("data-role", "") if row.cells else ""
-        gathered.append((row.attrs["data-name"], role, skill_tokens, is_import, cells))
+        gathered.append((row.attrs["data-name"], role, skills, expiring, is_import, cells, editable))
 
     issues: dict[str, str] = {}
     unknown: dict[str, str] = {}
     people: list[PersonDay] = []
-    for name, role, skill_tokens, is_import, cells in gathered:
+    for name, role, skills, expiring, is_import, cells, editable in gathered:
         on: list[bool] = []
         bookable: list[bool] = []
         for i in range(n):
@@ -211,7 +234,16 @@ def parse_day(html: str, day: date, tz: tzinfo) -> DaySchedule:
             on.append(c_on)
             bookable.append(c_book)
         people.append(
-            PersonDay(name, role, frozenset(skill_tokens), is_import, on, bookable)
+            PersonDay(
+                name=name,
+                role=role,
+                skills=frozenset(skills),
+                expiring=frozenset(expiring),
+                is_import=is_import,
+                on=on,
+                bookable=bookable,
+                is_me=editable and not is_import,
+            )
         )
 
     appliances: dict[str, list[str]] = {}
@@ -241,19 +273,65 @@ def parse_day(html: str, day: date, tz: tzinfo) -> DaySchedule:
     return DaySchedule(day, starts, people, appliances, issues)
 
 
-def is_dual_cover(p: PersonDay) -> bool:
-    """An import whose only skill is the pump-driver skill (the temporary
-    dual-role cover row)."""
-    return p.is_import and p.skills == frozenset({DRIVER_SKILL})
+# ---------------------------------------------------------------------------
+# brigade list (schedule page, after login)
 
 
-def find_appliance(appliances: dict[str, list[str]], label: str) -> list[str] | None:
-    """Exact (case-insensitive) match on the row label, else a contained match."""
-    want = label.strip().lower()
-    for k, v in appliances.items():
-        if k.strip().lower() == want:
-            return v
-    for k, v in appliances.items():
-        if want and want in k.lower():
-            return v
-    return None
+@dataclass(frozen=True)
+class Brigade:
+    id: int
+    name: str
+    selected: bool
+
+
+class _SelectParser(HTMLParser):
+    def __init__(self, select_id: str) -> None:
+        super().__init__(convert_charrefs=True)
+        self._want = select_id
+        self._inside = False
+        self._opt: dict[str, str] | None = None
+        self._text: list[str] = []
+        self.options: list[tuple[dict[str, str], str]] = []
+
+    def handle_starttag(self, tag, attrs):
+        a = {k.lower(): (v if v is not None else "") for k, v in attrs}
+        if tag == "select" and a.get("id") == self._want:
+            self._inside = True
+        elif tag == "option" and self._inside:
+            self._finish()
+            self._opt, self._text = a, []
+
+    def handle_endtag(self, tag):
+        if tag == "option":
+            self._finish()
+        elif tag == "select" and self._inside:
+            self._finish()
+            self._inside = False
+
+    def handle_data(self, data):
+        if self._opt is not None:
+            self._text.append(data)
+
+    def _finish(self):
+        if self._opt is not None:
+            self.options.append((self._opt, "".join(self._text).strip()))
+        self._opt = None
+
+
+BRIGADE_SELECT_ID = "ctrlBrigade_dropBrigade"
+
+
+def parse_brigades(html: str) -> list[Brigade]:
+    p = _SelectParser(BRIGADE_SELECT_ID)
+    p.feed(html)
+    p.close()
+    out: list[Brigade] = []
+    for attrs, text in p.options:
+        try:
+            bid = int(attrs.get("value", ""))
+        except ValueError:
+            continue
+        if bid <= 0 or not text:
+            continue
+        out.append(Brigade(bid, text, "selected" in attrs))
+    return out

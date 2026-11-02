@@ -9,9 +9,12 @@ import json
 from datetime import date
 from html.parser import HTMLParser
 
+from .parse import Brigade, parse_brigades
+
 # Verified against the original Node-RED flow.
 LOGIN_PATH = "/Availability/Account/Login.aspx"
-SCHEDULE_PATH = "/Availability/Availability/Schedule/AvailabilityMain1.aspx/GetSchedule"
+SCHEDULE_PAGE_PATH = "/Availability/Availability/Schedule/AvailabilityMain1.aspx"
+SCHEDULE_PATH = SCHEDULE_PAGE_PATH + "/GetSchedule"
 USER_FIELD = "txt_userid"
 PASSWORD_FIELD = "txt_pword"
 SUBMIT_FIELD = "btnLogin"
@@ -85,12 +88,12 @@ def has_auth_cookie(cookies: dict[str, str]) -> bool:
 
 
 class GartanClient:
-    def __init__(self, session, base_url, username, password, brigade_id, brigade_name):
+    def __init__(self, session, base_url, username, password, brigade_id=None, brigade_name=None):
         self._s = session
         self._base = base_url.rstrip("/")
         self._user = username
         self._pw = password
-        self._brigade_id = int(brigade_id)
+        self._brigade_id = int(brigade_id) if brigade_id is not None else None
         self._brigade_name = brigade_name
         self._cookies: dict[str, str] = {}
         self._logged_in = False
@@ -135,8 +138,38 @@ class GartanClient:
             raise AuthError("Login rejected (check username and password)")
         self._logged_in = True
 
+    def set_brigade(self, brigade_id: int, brigade_name: str) -> None:
+        self._brigade_id, self._brigade_name = int(brigade_id), brigade_name
+
+    async def fetch_brigades(self) -> list[Brigade]:
+        """The stations this login can see (the schedule page's station dropdown)."""
+        for _ in (1, 2):
+            if not self._logged_in:
+                await self.login()
+            try:
+                async with self._s.get(
+                    self._base + SCHEDULE_PAGE_PATH,
+                    headers=self._headers(),
+                    allow_redirects=False,
+                ) as r:
+                    status, text = r.status, await r.text()
+            except Exception as err:
+                raise FetchError(f"schedule page request failed: {err}") from err
+            if status >= 400:
+                raise FetchError(f"schedule page HTTP {status}")
+            if status < 300:
+                brigades = parse_brigades(text)
+                if brigades:
+                    return brigades
+                if 'type="password"' not in text.lower():
+                    raise FetchError("No stations found on the schedule page")
+            self._logged_in = False  # redirected to / shown the login page
+        raise FetchError("schedule page refused after a fresh login")
+
     async def fetch_day(self, day: date) -> str:
         """Return the schedule HTML for one day (15-minute resolution)."""
+        if self._brigade_id is None:
+            raise FetchError("No station selected")
         body = build_request_body(day, self._brigade_id, self._brigade_name)
         for attempt in (1, 2):
             if not self._logged_in:

@@ -5,11 +5,13 @@ from __future__ import annotations
 N = 96
 
 
-def _skills(skills):
-    return "".join(f'<font color="#0000FF">{s}</font> ' for s in skills)
+def _skills(skills, expiring=()):
+    return "".join(
+        f'<font color="{"#FF0000" if s in expiring else "#0000FF"}">{s}</font> ' for s in skills
+    )
 
 
-def person_row(idx, name, skills, cells, mine=False, imp=False):
+def person_row(idx, name, skills, cells, mine=False, imp=False, expiring=()):
     """cells: 'on' (white), 'A' (code 32), 'book' (blue dash), 'off' (grey O),
     or a callable i -> kind; a list/str of kinds per slot is also accepted."""
     prefix = "emp" if mine else "empRO"
@@ -31,7 +33,7 @@ def person_row(idx, name, skills, cells, mine=False, imp=False):
         else:
             attrs = 'class="schTD_off" data-codeId="1" data-alias="Off"'
         tds.append(f'<td id="{prefix}_{idx}-{i}" {attrs}>&nbsp;</td>')
-    tds.append(f'<td class="skillCol">{_skills(skills)}</td>')
+    tds.append(f'<td class="skillCol">{_skills(skills, expiring)}</td>')
     extra = ' data-id="0"' if imp else ""
     return f'<tr class="employee" data-name="{name}"{extra}>{"".join(tds)}</tr>'
 
@@ -47,7 +49,7 @@ def app_row(label, status_fn, rowid=8):
     return f'<tr class="appliance">{"".join(tds)}</tr>'
 
 
-def table(people, p1_fn, extra_rows=""):
+def table(people, p1_fn, extra_rows="", v1_fn=None):
     divider = '<tr class="importDivider"><td>Imports</td></tr>'
     normal = [p for p in people if not p.get("imp")]
     imports = [p for p in people if p.get("imp")]
@@ -55,6 +57,8 @@ def table(people, p1_fn, extra_rows=""):
     rows.append(divider)
     rows += [person_row(100 + i, **p) for i, p in enumerate(imports)]
     rows.append(app_row("KT52P1", p1_fn))
+    if v1_fn:
+        rows.append(app_row("KT52V1", v1_fn, rowid=9))
     rows.append(extra_rows)
     return "<table>" + "".join(rows) + "</table>"
 
@@ -67,3 +71,11 @@ def slot(hhmm: str) -> int:
 def window(a: str, b: str, kind, otherwise="off"):
     s, e = slot(a), slot(b)
     return lambda i: kind if s <= i < e else otherwise
+
+
+BRIGADE_PAGE = """
+<select name="ctrlBrigade$dropBrigade" id="ctrlBrigade_dropBrigade" class="controlText">
+  <option selected="selected" value="2">KT52 Cricklade</option>
+</select>
+<select id="listResolution"><option value="60">60 min</option></select>
+"""

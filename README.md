@@ -1,57 +1,116 @@
 # Gartan Availability (Home Assistant custom integration)
 
-Scrapes the Gartan availability tool and exposes the appliance (52P1) and your own
-on-call schedule as calendars, plus sensors for next on/off, who's on, and
-bookable windows. Replaces the Node-RED flow.
+Reads the Gartan availability schedule and exposes it to Home Assistant: a calendar
+per appliance, your own on-call calendar, current-state and next-change sensors, and
+a compact whole-week schedule for your own templates and automations.
 
-Stage 1 and 2 only: **no notifications, widgets or automations yet.**
+Nothing station- or person-specific is built in:
+- the station comes from your account
+- your own row is detected automatically
+- appliances are picked from the rows Gartan returns
+- crewing rules, role grouping and booking suggestions are left to your own
+  templates (see [Using the schedule sensor](#using-the-schedule-sensor))
 
 ## Install
 
-Copy `custom_components/gartan/` to `/config/custom_components/gartan/`, restart, then
-Settings > Devices & services > Add integration > Gartan Availability. For HACS, put
-this repo's contents at the repo root and add it as a custom repository (replace
-`REPLACE_ME` in `manifest.json`). Rotate the Gartan password first: it was in
-plaintext in the old flow export.
+Via HACS: add this repository as a custom repository (type: integration), install,
+restart. Or copy `custom_components/gartan/` to `/config/custom_components/gartan/`
+and restart.
 
-## Entities (device "Gartan")
+Then go to Settings > Devices & services > Add integration > Gartan Availability.
+Setup asks for the Gartan site URL, username and password, then:
+1. reads the stations your login can see. If there's more than one, it asks which.
+2. fetches today's schedule and finds your row. If that fails, it asks you to pick it.
+3. asks which appliances get their own entities. All of them are selected by default.
+
+## Entities
+
+Entity ids come from the device names. `<appliance>` is the Gartan row label in
+lower case, e.g. `kt52p1`. You can rename any entity in the UI.
+
+**Gartan** (station and you)
 
 | Entity | Meaning |
 |---|---|
-| `calendar.gartan_52p1` | Appliance on-the-run periods (Available/Alternate) + "out on shout" |
-| `calendar.gartan_tom` | Your on-call periods |
-| `binary_sensor.gartan_52p1_on` / `_deployed` | On the run now / Off Station (pink) |
-| `binary_sensor.gartan_tom_on_call` | You are on call now |
-| `binary_sensor.gartan_needs_attention` | Any issue (also raised in Repairs) |
-| `sensor.gartan_52p1_next_on` / `_next_off` | Timestamps; unknown while deployed or if the run reaches the end of the known week |
-| `sensor.gartan_tom_next_on_call` / `_next_off_call` | Same, for you |
-| `sensor.gartan_who_is_on` | Count; attributes `ic`, `driver`, `ba`, `others`, `visiting`, `off` |
-| `sensor.gartan_bookable_windows` | Count; attributes `windows` and ready-made `text` |
-| `sensor.gartan_last_scrape`, `sensor.gartan_crew_rule_mismatches` | Diagnostics |
+| `calendar.gartan_on_call` | Your on-call periods |
+| `binary_sensor.gartan_on_call` | You're on call now |
+| `sensor.gartan_next_on_call` / `sensor.gartan_next_off_call` | Timestamps |
+| `sensor.gartan_who_is_on` | Number of people on now; attribute `people` (name, imported, skills) |
+| `sensor.gartan_schedule` | The whole known week (see below) |
+| `binary_sensor.gartan_needs_attention` | Any issue (also raised in Settings > Repairs) |
+| `sensor.gartan_last_scrape` | Diagnostic |
 
-Entity ids come from the names chosen at setup (`52p1`, `Tom`); changing them later
-doesn't rename existing entities.
+**Gartan `<APPLIANCE>`** (one device per selected appliance)
+
+| Entity | Meaning |
+|---|---|
+| `calendar.gartan_<appliance>` | On-the-run periods (Available or Alternate), plus "out on a call" |
+| `binary_sensor.gartan_<appliance>_on_the_run` | On the run now; attribute `status` |
+| `binary_sensor.gartan_<appliance>_deployed` | Out on a call (Off Station) now |
+| `sensor.gartan_<appliance>_next_on_the_run` / `_next_off_the_run` | Timestamps; unknown while out on a call |
+
+"Next off" timestamps are unknown when a run reaches the end of the known 7 days.
+
+## Using the schedule sensor
+
+`sensor.gartan_schedule` has these attributes. They are excluded from the recorder,
+so they don't bloat the database.
+
+```yaml
+start: "2026-11-02T00:00:00+00:00"   # slot 0 = local midnight today
+slot_minutes: 15
+slots: 672                           # 7 days
+appliances:
+  KT52P1: "OOOOAAAALLLL…"            # one char per slot (see legend)
+people:
+  - name: "SURNAME, I"
+    me: false
+    imported: false                  # true for rows below Gartan's import divider
+    skills: ["IC1", "BA"]
+    expiring: ["BA"]                 # skills Gartan shows in red
+    slots: "1111000bbbb…"            # 1 on, 0 off, b bookable (unbooked, can book)
+legend:
+  appliance: {A: available, L: alternate, O: off_the_run, S: off_station, "?": unknown}
+  person: {"1": on, "0": off, b: bookable}
+```
+
+Slot `i` covers `start + i × 15 min`. The index for now:
+
+```jinja
+{% set s = state_attr('sensor.gartan_schedule', 'start') | as_datetime %}
+{% set i = ((now() - s).total_seconds() // 900) | int %}
+```
+
+For example, the people on now who hold a given skill:
+
+```jinja
+{{ state_attr('sensor.gartan_schedule', 'people')
+   | selectattr('slots', 'search', '^.{' ~ i ~ '}1')
+   | selectattr('skills', 'contains', 'IC1')
+   | map(attribute='name') | list }}
+```
+
+While an appliance is out on a call, Gartan marks every future slot Off Station.
+The integration replaces those future slots with the last schedule seen before the
+call-out (kept in `.storage`), so the export and calendars stay useful.
 
 ## Behaviour
 
-- Today every 5 minutes; the full 7 days roughly hourly. 15-minute resolution.
-- The appliance calendar uses Gartan's own appliance row, not our crew rule.
-- During a call-out the future pink slots are replaced by the last pre-call-out
-  schedule (kept in `.storage`), so the calendar stays useful.
-- Bookable = blue-dash cell with no booking id. Unknown booking codes or appliance
-  statuses are treated as not available and raise an issue. A raw capture of the
-  response is saved to `/config/gartan_captures/` (max 20) for each new oddity and
-  for call-outs.
-- Dual-role cover imports (only skill ERD/Ang) are dropped from crew counts;
-  other imports count as visitors.
-- `crew_rule_mismatches` counts slots where our rule disagrees with Gartan's row.
-  Informational only. Persistent mismatches mean the booking-window logic needs
-  tuning (the calendars are unaffected).
+- Fetches today every 5 minutes and the full 7 days roughly hourly, at 15-minute
+  resolution.
+- Appliance status comes from the appliance cell's title. Only Available, Alternate,
+  Off the Run and Off Station have been seen. Anything else counts as not on the run
+  and raises an attention issue with the exact text.
+- A person cell counts as on when it is white (contracted) or booked Available or
+  Co-responder. "Bookable" means a blue-dash cell with no booking. Unknown booking
+  codes count as not available and raise an issue.
+- For each new oddity, and for each call-out, a raw copy of the response is saved to
+  `/config/gartan_captures/` (max 20). They contain names, so don't share them as-is.
 
 ## Tests
 
     python -m unittest discover -s tests -t .
-    python tools/replay.py capture.json 2026-11-02 --me "CLABON, T"
+    python tools/replay.py capture.json 2026-11-02 --export
 
 Fixtures in `tests/` are synthetic. Scrub names and payroll numbers from real
 captures before committing them.

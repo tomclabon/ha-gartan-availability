@@ -1,4 +1,4 @@
-"""Sensors: next on/off, who's on, booking windows, last scrape, rule check."""
+"""Sensors: next on/off, who's on, whole-week schedule, last scrape."""
 from __future__ import annotations
 
 from datetime import datetime
@@ -7,49 +7,60 @@ from homeassistant.components.sensor import SensorDeviceClass, SensorEntity
 from homeassistant.const import EntityCategory
 from homeassistant.util import dt as dt_util
 
+from .coordinator import selected_appliances
 from .core.model import next_on_off
-from .core.view import Window, crew_groups
-from .entity import (
-    GartanEntity,
-    deployed_now,
-    me_runs,
-    my_label,
-    truck_label,
-    truck_runs,
-)
+from .core.view import people_on, schedule_export
+from .entity import ApplianceEntity, GartanEntity, appliance_runs, me_runs, status_now
+from .core.const import STATUS_OFF_STATION
 
 
 async def async_setup_entry(hass, entry, async_add_entities) -> None:
     c = entry.runtime_data
-    t, m = truck_label(c), my_label(c)
-    async_add_entities(
-        [
-            NextChange(c, "truck_next_on", f"{t} next on", truck_runs, True, True),
-            NextChange(c, "truck_next_off", f"{t} next off", truck_runs, False, True),
-            NextChange(c, "me_next_on", f"{m} next on call", me_runs, True, False),
-            NextChange(c, "me_next_off", f"{m} next off call", me_runs, False, False),
-            WhoIsOn(c),
-            BookableWindows(c, t),
-            LastScrape(c),
-            RuleCheck(c),
+    entities: list = [
+        MyNext(c, "next_on_call", "Next on call", True),
+        MyNext(c, "next_off_call", "Next off call", False),
+        WhoIsOn(c),
+        Schedule(c),
+        LastScrape(c),
+    ]
+    for label in selected_appliances(entry):
+        entities += [
+            ApplianceNext(c, label, "next_on_the_run", "Next on the run", True),
+            ApplianceNext(c, label, "next_off_the_run", "Next off the run", False),
         ]
-    )
+    async_add_entities(entities)
 
 
-class NextChange(GartanEntity, SensorEntity):
+class MyNext(GartanEntity, SensorEntity):
     _attr_device_class = SensorDeviceClass.TIMESTAMP
 
-    def __init__(self, coordinator, key, name, runs_fn, want_on, is_truck) -> None:
+    def __init__(self, coordinator, key, name, want_on) -> None:
         super().__init__(coordinator, key, name)
-        self._runs_fn, self._want_on, self._is_truck = runs_fn, want_on, is_truck
+        self._want_on = want_on
 
     @property
     def native_value(self) -> datetime | None:
         view = self.view
-        if view is None or (self._is_truck and deployed_now(view)):
-            return None  # truck is out: its schedule is unreliable until it returns
+        if view is None:
+            return None
+        nxt_on, nxt_off, _ = next_on_off(me_runs(view), dt_util.utcnow(), view.timeline.end)
+        return nxt_on if self._want_on else nxt_off
+
+
+class ApplianceNext(ApplianceEntity, SensorEntity):
+    _attr_device_class = SensorDeviceClass.TIMESTAMP
+
+    def __init__(self, coordinator, label, key, name, want_on) -> None:
+        super().__init__(coordinator, label, key, name)
+        self._want_on = want_on
+
+    @property
+    def native_value(self) -> datetime | None:
+        app, view = self.app, self.view
+        if app is None or status_now(app, view) == STATUS_OFF_STATION:
+            return None  # out on a call: its schedule is unreliable until it returns
         nxt_on, nxt_off, _ = next_on_off(
-            self._runs_fn(view), dt_util.utcnow(), view.timeline.end
+            appliance_runs(app, view), dt_util.utcnow(), view.timeline.end
         )
         return nxt_on if self._want_on else nxt_off
 
@@ -63,66 +74,33 @@ class WhoIsOn(GartanEntity, SensorEntity):
 
     @property
     def native_value(self) -> int | None:
-        view = self.view
-        i = view.timeline.index_at(dt_util.utcnow())
-        return None if i is None else len(view.timeline.members_on(i))
+        return len(people_on(self.view, dt_util.utcnow()))
 
     @property
     def extra_state_attributes(self) -> dict:
-        g = crew_groups(self.view, self.coordinator.cfg, dt_util.utcnow())
-        return {
-            "ic": g["ic"],
-            "driver": g["driver"],
-            "ba": g["ba"],
-            "others": g["others"],
-            "visiting": g["visiting"],
-            "off": g["off"],
-        }
+        return {"people": people_on(self.view, dt_util.utcnow())}
 
 
-def window_text(w: Window, label: str) -> str:
-    s, e = dt_util.as_local(w.start), dt_util.as_local(w.end)
-    day = s.strftime("%a %d %b")
-    span = f"{s:%H:%M}-{e:%H:%M} ({w.minutes} min)"
-    if w.goes_on:
-        why = f"{label} goes on if you book"
-        if w.needs_dual_role:
-            why += " (assuming the dual-role import is created)"
-    else:
-        why = "still short even if you book: " + ", ".join(w.missing)
-    return f"{day} {span}: {why}"
+class Schedule(GartanEntity, SensorEntity):
+    """The whole known week, compact, for downstream templates.
+    State: when the schedule was generated. Attributes are not recorded."""
 
+    _attr_device_class = SensorDeviceClass.TIMESTAMP
+    _attr_icon = "mdi:calendar-clock"
+    _unrecorded_attributes = frozenset(
+        {"start", "slot_minutes", "slots", "appliances", "people", "legend"}
+    )
 
-class BookableWindows(GartanEntity, SensorEntity):
-    _attr_icon = "mdi:calendar-plus"
-    _attr_native_unit_of_measurement = "windows"
-
-    def __init__(self, coordinator, truck: str) -> None:
-        super().__init__(coordinator, "bookable_windows", "Bookable windows")
-        self._truck = truck
+    def __init__(self, coordinator) -> None:
+        super().__init__(coordinator, "schedule", "Schedule")
 
     @property
-    def native_value(self) -> int:
-        return len(self.view.windows)
+    def native_value(self) -> datetime | None:
+        return self.view.generated if self.view else None
 
     @property
     def extra_state_attributes(self) -> dict:
-        ws = self.view.windows
-        return {
-            "windows": [
-                {
-                    "start": dt_util.as_local(w.start).isoformat(),
-                    "end": dt_util.as_local(w.end).isoformat(),
-                    "minutes": w.minutes,
-                    "truck_goes_on": w.goes_on,
-                    "needs_dual_role_import": w.needs_dual_role,
-                    "fills": w.fills,
-                    "still_missing": w.missing,
-                }
-                for w in ws
-            ],
-            "text": "\n".join(window_text(w, self._truck) for w in ws),
-        }
+        return schedule_export(self.view)
 
 
 class LastScrape(GartanEntity, SensorEntity):
@@ -135,23 +113,3 @@ class LastScrape(GartanEntity, SensorEntity):
     @property
     def native_value(self) -> datetime | None:
         return self.coordinator.last_success
-
-
-class RuleCheck(GartanEntity, SensorEntity):
-    """How often our crew rule disagrees with Gartan's own appliance row.
-    Informational: Gartan's row is the source of truth for the calendars."""
-
-    _attr_entity_category = EntityCategory.DIAGNOSTIC
-    _attr_icon = "mdi:scale-balance"
-    _attr_native_unit_of_measurement = "slots"
-
-    def __init__(self, coordinator) -> None:
-        super().__init__(coordinator, "rule_check", "Crew rule mismatches")
-
-    @property
-    def native_value(self) -> int:
-        return self.view.diagnostics["mismatched_slots"]
-
-    @property
-    def extra_state_attributes(self) -> dict:
-        return self.view.diagnostics

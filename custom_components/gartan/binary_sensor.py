@@ -4,31 +4,49 @@ from __future__ import annotations
 from homeassistant.components.binary_sensor import BinarySensorDeviceClass, BinarySensorEntity
 from homeassistant.util import dt as dt_util
 
-from .entity import GartanEntity, deployed_now, me_on_now, my_label, truck_label, truck_on_now
+from .coordinator import selected_appliances
+from .core.const import ON_STATUSES, STATUS_OFF_STATION
+from .entity import ApplianceEntity, GartanEntity, me_on_now, status_now
 
 
 async def async_setup_entry(hass, entry, async_add_entities) -> None:
     c = entry.runtime_data
-    t, m = truck_label(c), my_label(c)
-    async_add_entities(
-        [
-            Flag(c, "truck_on", f"{t} on", lambda v: truck_on_now(v), BinarySensorDeviceClass.RUNNING),
-            Flag(c, "truck_deployed", f"{t} deployed", lambda v: deployed_now(v), None),
-            Flag(c, "me_on_call", f"{m} on call", lambda v: me_on_now(v), None),
-            Attention(c),
+    entities: list = [OnCall(c), Attention(c)]
+    for label in selected_appliances(entry):
+        entities += [
+            ApplianceFlag(c, label, "on_the_run", "On the run", ON_STATUSES, BinarySensorDeviceClass.RUNNING),
+            ApplianceFlag(c, label, "deployed", "Deployed", frozenset({STATUS_OFF_STATION}), None),
         ]
-    )
+    async_add_entities(entities)
 
 
-class Flag(GartanEntity, BinarySensorEntity):
-    def __init__(self, coordinator, key, name, fn, device_class) -> None:
-        super().__init__(coordinator, key, name)
-        self._fn = fn
+class OnCall(GartanEntity, BinarySensorEntity):
+    def __init__(self, coordinator) -> None:
+        super().__init__(coordinator, "on_call", "On call")
+
+    @property
+    def is_on(self) -> bool | None:
+        return None if self.coordinator.data is None else me_on_now(self.view)
+
+
+class ApplianceFlag(ApplianceEntity, BinarySensorEntity):
+    def __init__(self, coordinator, label, key, name, statuses, device_class) -> None:
+        super().__init__(coordinator, label, key, name)
+        self._statuses = statuses
         self._attr_device_class = device_class
 
     @property
     def is_on(self) -> bool | None:
-        return None if self.coordinator.data is None else bool(self._fn(self.view))
+        app = self.app
+        if app is None:
+            return None
+        st = status_now(app, self.view)
+        return None if st is None else st in self._statuses
+
+    @property
+    def extra_state_attributes(self) -> dict:
+        app = self.app
+        return {"status": status_now(app, self.view) if app else None}
 
 
 class Attention(GartanEntity, BinarySensorEntity):

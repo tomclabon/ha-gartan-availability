@@ -5,11 +5,11 @@ import json
 import logging
 from datetime import date, datetime, timedelta
 
+from aiohttp import DummyCookieJar
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.exceptions import ConfigEntryAuthFailed
 from homeassistant.helpers import issue_registry as ir
-from aiohttp import DummyCookieJar
 from homeassistant.helpers.aiohttp_client import async_create_clientsession
 from homeassistant.helpers.event import async_track_time_change
 from homeassistant.helpers.storage import Store
@@ -17,20 +17,11 @@ from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, Upda
 from homeassistant.util import dt as dt_util
 
 from .const import (
-    CONF_APPLIANCE,
+    CONF_APPLIANCES,
     CONF_BASE_URL,
     CONF_BRIGADE_ID,
     CONF_BRIGADE_NAME,
-    CONF_DISPLAY_NAMES,
-    CONF_DUAL_ROLE,
     CONF_ME,
-    CONF_WHAT_IF,
-    DEFAULT_APPLIANCE,
-    DEFAULT_BASE_URL,
-    DEFAULT_BRIGADE_ID,
-    DEFAULT_BRIGADE_NAME,
-    DEFAULT_DUAL_ROLE,
-    DEFAULT_ME,
     DOMAIN,
     MAX_CAPTURES,
     STALE_AFTER,
@@ -41,7 +32,7 @@ from .const import (
 from .core.client import AuthError, FetchError, GartanClient
 from .core.const import STATUS_OFF_STATION
 from .core.parse import DaySchedule, parse_day
-from .core.view import CoreConfig, View, build_view
+from .core.view import CoreConfig, View, appliance_labels, build_view
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -52,30 +43,8 @@ def opt(entry: ConfigEntry, key: str, default=None):
     return entry.data.get(key, default)
 
 
-def parse_lines(text: str, sep: str = "") -> list[str]:
-    return [ln.strip() for ln in (text or "").splitlines() if ln.strip()]
-
-
-def parse_display_names(text: str) -> dict[str, str]:
-    out: dict[str, str] = {}
-    for ln in parse_lines(text):
-        if "=" in ln:
-            k, v = ln.split("=", 1)
-            if k.strip() and v.strip():
-                out[k.strip().upper()] = v.strip()
-    return out
-
-
-def core_config(entry: ConfigEntry) -> CoreConfig:
-    return CoreConfig(
-        appliance_label=opt(entry, CONF_APPLIANCE, DEFAULT_APPLIANCE),
-        my_name=opt(entry, CONF_ME, DEFAULT_ME),
-        dual_names=frozenset(
-            n.upper() for n in parse_lines(opt(entry, CONF_DUAL_ROLE, DEFAULT_DUAL_ROLE))
-        ),
-        extra_skills=frozenset(opt(entry, CONF_WHAT_IF, "").split()),
-        display_names=parse_display_names(opt(entry, CONF_DISPLAY_NAMES, "")),
-    )
+def selected_appliances(entry: ConfigEntry) -> list[str]:
+    return list(opt(entry, CONF_APPLIANCES, []) or [])
 
 
 class GartanCoordinator(DataUpdateCoordinator[View]):
@@ -85,27 +54,28 @@ class GartanCoordinator(DataUpdateCoordinator[View]):
         super().__init__(
             hass, _LOGGER, name=DOMAIN, config_entry=entry, update_interval=TODAY_INTERVAL
         )
-        self.cfg = core_config(entry)
+        self.cfg = CoreConfig(my_name=(opt(entry, CONF_ME, "") or "").strip())
         self._session = async_create_clientsession(
             hass, cookie_jar=DummyCookieJar(), auto_cleanup=False
         )
         self._client = GartanClient(
             self._session,
-            opt(entry, CONF_BASE_URL, DEFAULT_BASE_URL),
+            entry.data[CONF_BASE_URL],
             entry.data["username"],
             entry.data["password"],
-            opt(entry, CONF_BRIGADE_ID, DEFAULT_BRIGADE_ID),
-            opt(entry, CONF_BRIGADE_NAME, DEFAULT_BRIGADE_NAME),
+            entry.data[CONF_BRIGADE_ID],
+            entry.data[CONF_BRIGADE_NAME],
         )
-        self._store: Store = Store(hass, 1, f"{DOMAIN}.{entry.entry_id}")
+        self._store: Store = Store(hass, 2, f"{DOMAIN}.{entry.entry_id}")
         self._days: dict[date, DaySchedule] = {}
         self._raw: dict[date, str] = {}
         self._week_at: datetime | None = None
-        self._baseline: dict[str, str] = {}
+        self._baseline: dict[str, dict[str, str]] = {}
         self._captured: set[str] = set()
         self._issue_ids: set[str] = set()
         self.last_success: datetime | None = None
         self.last_error: str | None = None
+        self.known_appliances: list[str] = []
         self._unsub_tick = async_track_time_change(
             hass, self._tick, minute=[0, 15, 30, 45], second=2
         )
@@ -113,7 +83,9 @@ class GartanCoordinator(DataUpdateCoordinator[View]):
     # -- lifecycle ---------------------------------------------------------
     async def async_load(self) -> None:
         data = await self._store.async_load() or {}
-        self._baseline = data.get("baseline", {})
+        base = data.get("baseline", {})
+        if isinstance(base, dict) and all(isinstance(v, dict) for v in base.values()):
+            self._baseline = base
 
     @callback
     def async_cleanup(self) -> None:
@@ -168,12 +140,18 @@ class GartanCoordinator(DataUpdateCoordinator[View]):
             _LOGGER.warning("Gartan fetch problems: %s", self.last_error)
         else:
             self.last_error = None
-        if today in wanted and not any(f.startswith(str(today)) for f in failed):
+        if not any(f.startswith(str(today)) for f in failed):
             self.last_success = now
         elif today not in self._days:
             raise UpdateFailed(self.last_error or "no schedule for today")
 
         view = build_view(self._days.values(), self.cfg, self._baseline, now)
+        for label in selected_appliances(self.config_entry):
+            if label not in view.appliances:
+                view.issues[f"appliance_missing_{label}"] = (
+                    f"Appliance {label!r} is no longer in the schedule"
+                )
+        self.known_appliances = appliance_labels(self._days.values())
         if view.baseline != self._baseline:
             self._baseline = view.baseline
             self._store.async_delay_save(lambda: {"baseline": self._baseline}, 30)
@@ -210,7 +188,9 @@ class GartanCoordinator(DataUpdateCoordinator[View]):
     # -- raw capture of interesting responses ------------------------------
     async def _maybe_capture(self, view: View, today: date) -> None:
         reasons = set(view.issues)
-        if view.deployed or any(s == STATUS_OFF_STATION for s in view.timeline.p1_raw):
+        if any(
+            STATUS_OFF_STATION in a.raw or a.deployed for a in view.appliances.values()
+        ):
             reasons.add("off_station")
         new = reasons - self._captured
         if not new or today not in self._raw:

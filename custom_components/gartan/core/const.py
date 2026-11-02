@@ -5,17 +5,9 @@ from datetime import timedelta
 
 SLOT = timedelta(minutes=15)
 
-# Skills (exact tokens as shown in the Gartan skills column)
-IC_SKILL = "IC1"
-DRIVER_SKILL = "ERD/Ang"
-BA_SKILL = "BA"
-
-# Pump crewing rule (see README: derived from sample days, verified by diagnostics)
-MIN_CREW = 4
-MIN_BA = 2
-MIN_COMPETENT_FF = 3  # everyone counts as competent, so MIN_CREW already covers it
-
-# Appliance statuses (from the title text of the appliance cells)
+# Appliance statuses, from the text at the end of each appliance cell's title,
+# e.g. "KT52P1 (0000 - 0015) Available". Only these titles have been seen;
+# anything else is reported as unknown (and raises an attention issue).
 STATUS_AVAILABLE = "available"
 STATUS_ALTERNATE = "alternate"
 STATUS_OFF_RUN = "off_the_run"
@@ -28,6 +20,16 @@ STATUS_BY_TEXT = {
     "off the run": STATUS_OFF_RUN,
     "off station": STATUS_OFF_STATION,
 }
+
+# One character per slot in the schedule sensor.
+STATUS_CHAR = {
+    STATUS_AVAILABLE: "A",
+    STATUS_ALTERNATE: "L",
+    STATUS_OFF_RUN: "O",
+    STATUS_OFF_STATION: "S",
+    STATUS_UNKNOWN: "?",
+}
+PERSON_ON, PERSON_OFF, PERSON_BOOKABLE = "1", "0", "b"
 
 # Booking codes (data-codeId). Anything not listed is treated as NOT available
 # and raises an attention issue.

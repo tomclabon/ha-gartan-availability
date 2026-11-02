@@ -112,6 +112,19 @@ class SummaryTests(unittest.TestCase):
         self.assertEqual(s["since_start"].weeks, 9)
         self.assertTrue(s["since_start"].complete)
 
+    def test_partial_slot_not_counted_and_quarters(self):
+        led = self.ledger()
+        led.weeks[date(2026, 11, 2)] = WeekHours(date(2026, 11, 2), 83.0, 90.0)
+        now = datetime(2026, 11, 4, 12, 7, tzinfo=U)  # 7 minutes into the 12:00 slot
+        today = day(date(2026, 11, 4), crew(me_cells=window("12:00", "13:00", "on", "off")))
+        view = build_view([today], CoreConfig(), {}, now)
+        s = hours_summary(led, view, now, TZ)["this_week"]
+        self.assertEqual(s.actual, 15.0)  # Mon 10 + Tue 5, current slot not complete
+        for v in (s.actual, s.contract, s.difference):
+            self.assertEqual(v * 4, int(v * 4))  # whole quarter hours
+        later = datetime(2026, 11, 4, 12, 15, tzinfo=U)
+        self.assertEqual(hours_summary(led, view, later, TZ)["this_week"].actual, 15.25)
+
     def test_callout_counts_include_today(self):
         led = self.ledger()
         led.days[date(2026, 11, 3)].callouts = [

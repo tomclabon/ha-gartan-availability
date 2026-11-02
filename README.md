@@ -74,19 +74,20 @@ Assistant recorder history isn't needed.
 - **Rebuild history** (button) clears the ledger and loads it all again.
 - `sensor.gartan_availability_history` shows the progress.
 
-**Hours** (Gartan's weekly figures: contract, and actual in brackets)
+**Hours** (Gartan's weekly figures: contract, and actual in brackets), rounded
+to 15 minutes. Each period has an Actual and a Contract sensor:
 
-| Sensor | Actual vs contract over |
-|---|---|
-| `sensor.gartan_availability_hours_this_week` | Monday 00:00 to now (contract pro-rata) |
-| `sensor.gartan_availability_hours_last_4_weeks` | the previous 4 weeks plus this week so far |
-| `sensor.gartan_availability_hours_last_52_weeks` | the previous 52 weeks plus this week so far |
-| `sensor.gartan_availability_hours_since_start` | every week since you started plus this week so far |
+| Period | Actual | Contract | Covers |
+|---|---|---|---|
+| This week | `sensor.gartan_availability_hours_this_week` | `..._contract_hours_this_week` | Monday 00:00 to now (contract pro-rata) |
+| Last 4 weeks | `..._hours_last_4_weeks` | `..._contract_hours_last_4_weeks` | previous 4 weeks plus this week so far |
+| Last 52 weeks | `..._hours_last_52_weeks` | `..._contract_hours_last_52_weeks` | previous 52 weeks plus this week so far |
+| Since start | `..._hours_since_start` | `..._contract_hours_since_start` | every week since you started plus this week so far |
 
-Each state is your actual on-call hours. The attributes are `contract`,
-`difference`, `under_contract` and `complete`; `complete` is false while history
-is still loading. This week also has `week_contract` and `week_scheduled`, Gartan's
-figures for the whole week.
+Only completed 15-minute slots count towards this week. Both sensors carry the
+attributes `actual`, `contract`, `difference`, `under_contract` and `complete`;
+`complete` is false while history is still loading. This week also has
+`week_contract` and `week_scheduled`, Gartan's figures for the whole week.
 
 **Call-outs**
 - A run of Off Station slots on an appliance counts as one call-out. You count as

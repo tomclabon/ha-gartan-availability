@@ -39,7 +39,7 @@ async def async_setup_entry(hass, entry, async_add_entities) -> None:
         LastScrape(c),
         HistoryStatus(c),
     ]
-    entities += [Hours(c, period) for period in PERIODS]
+    entities += [Hours(c, period, kind) for period in PERIODS for kind in ("actual", "contract")]
     for label in selected_appliances(entry):
         entities += [
             ApplianceNext(c, label, "next_on_the_run", "Next on the run", True),
@@ -134,18 +134,22 @@ class LastScrape(GartanEntity, SensorEntity):
 
 
 class Hours(HistoryListenerMixin, GartanEntity, SensorEntity):
-    """Your on-call hours against contract for a Gartan-week period.
-    State: actual hours. "This week" counts only the part already passed, and
-    its contract is pro-rata; the longer periods add that to whole past weeks."""
+    """Your on-call hours (actual) or expected hours (contract) for a period of
+    Gartan weeks, rounded to 15 minutes. "This week" covers Monday 00:00 to now
+    (completed slots only; contract pro-rata); the longer periods add whole past
+    weeks."""
 
     _attr_device_class = SensorDeviceClass.DURATION
     _attr_native_unit_of_measurement = UnitOfTime.HOURS
-    _attr_suggested_display_precision = 1
-    _attr_icon = "mdi:clock-check-outline"
+    _attr_suggested_display_precision = 2
 
-    def __init__(self, coordinator, period: str) -> None:
-        super().__init__(coordinator, f"hours_{period}", f"Hours {PERIOD_NAMES[period]}")
-        self._period = period
+    def __init__(self, coordinator, period: str, kind: str) -> None:
+        # actual keeps its original key so existing entity ids stay the same
+        key = f"hours_{period}" if kind == "actual" else f"contract_hours_{period}"
+        name = f"{kind.capitalize()} hours {PERIOD_NAMES[period]}"
+        super().__init__(coordinator, key, name)
+        self._period, self._kind = period, kind
+        self._attr_icon = "mdi:clock-check-outline" if kind == "actual" else "mdi:file-clock-outline"
 
     def _summary(self):
         tz = dt_util.get_default_time_zone()
@@ -153,12 +157,14 @@ class Hours(HistoryListenerMixin, GartanEntity, SensorEntity):
 
     @property
     def native_value(self) -> float:
-        return self._summary().actual
+        s = self._summary()
+        return s.actual if self._kind == "actual" else s.contract
 
     @property
     def extra_state_attributes(self) -> dict:
         s = self._summary()
         attrs = {
+            "actual": s.actual,
             "contract": s.contract,
             "difference": s.difference,
             "under_contract": s.actual < s.contract,

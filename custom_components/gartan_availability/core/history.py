@@ -167,6 +167,11 @@ PERIODS = ("this_week", "last_4_weeks", "last_52_weeks", "since_start")
 PERIOD_WEEKS = {"this_week": 0, "last_4_weeks": 4, "last_52_weeks": 52}
 
 
+def quarter(hours: float) -> float:
+    """Round to the schedule's 15-minute granularity."""
+    return round(hours * 4) / 4
+
+
 @dataclass
 class HoursSummary:
     actual: float  # hours on call
@@ -176,7 +181,7 @@ class HoursSummary:
 
     @property
     def difference(self) -> float:
-        return round(self.actual - self.contract, 2)
+        return quarter(self.actual - self.contract)
 
 
 def _week_start(now: datetime, tz: tzinfo) -> tuple[date, datetime]:
@@ -199,11 +204,10 @@ def this_week_so_far(ledger: Ledger, view: View | None, now: datetime, tz: tzinf
         tl = view.timeline
         s = tl.series[view.me_key]
         for i, st in enumerate(tl.starts):
+            # completed slots only: the schedule has 15-minute granularity
             if st.astimezone(tz).date() == today and st + SLOT <= now and s.on[i]:
                 minutes += SLOT.total_seconds() / 60
-            elif st.astimezone(tz).date() == today and st <= now < st + SLOT and s.on[i]:
-                minutes += (now - st).total_seconds() / 60
-    return round(minutes / 60, 2)
+    return quarter(minutes / 60)
 
 
 def hours_summary(
@@ -224,8 +228,8 @@ def hours_summary(
         past = [monday - timedelta(weeks=k) for k in range(1, n + 1)]
         got = [ledger.weeks[m] for m in past if m in ledger.weeks]
         out[period] = HoursSummary(
-            actual=round(sum(w.actual for w in got) + so_far, 2),
-            contract=round(sum(w.contract for w in got) + contract_so_far, 2),
+            actual=quarter(sum(w.actual for w in got) + so_far),
+            contract=quarter(sum(w.contract for w in got) + contract_so_far),
             weeks=n,
             complete=len(got) == n and this is not None,
         )

@@ -1,0 +1,12 @@
+{
+  "domain": "gartan",
+  "name": "Gartan Availability",
+  "codeowners": [],
+  "config_flow": true,
+  "documentation": "https://github.com/REPLACE_ME/ha-gartan-availability",
+  "integration_type": "service",
+  "iot_class": "cloud_polling",
+  "issue_tracker": "https://github.com/REPLACE_ME/ha-gartan-availability/issues",
+  "requirements": [],
+  "version": "0.1.0"
+}

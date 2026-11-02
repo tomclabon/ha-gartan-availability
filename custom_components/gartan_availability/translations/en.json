@@ -13,22 +13,30 @@
       "brigade": {
         "title": "Station",
         "description": "Your login can see more than one station. Which one?",
-        "data": { "brigade_id": "Station" }
+        "data": {
+          "brigade_id": "Station"
+        }
       },
       "me": {
         "title": "Which row is you?",
         "description": "Your own row couldn't be detected automatically. Pick it from the schedule.",
-        "data": { "me": "Your row" }
+        "data": {
+          "me": "Your row"
+        }
       },
       "appliances": {
         "title": "Appliances",
         "description": "Create calendar and status entities for these appliances. Every appliance is included in the schedule sensor regardless.",
-        "data": { "appliances": "Appliances" }
+        "data": {
+          "appliances": "Appliances"
+        }
       },
       "reauth_confirm": {
         "title": "Gartan login failed",
         "description": "Enter the new password.",
-        "data": { "password": "Password" }
+        "data": {
+          "password": "Password"
+        }
       }
     },
     "error": {
@@ -52,7 +60,9 @@
         "title": "Gartan options",
         "data": {
           "appliances": "Appliances with their own entities",
-          "me": "Your row name (leave blank to detect automatically)"
+          "me": "Your row name (leave blank to detect automatically)",
+          "history_years": "Years of history to load (0 = off)",
+          "employee_brigade_id": "Employee id for your two-week view (leave blank to detect)"
         }
       }
     }

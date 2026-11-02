@@ -105,3 +105,13 @@ class ApplianceEntity(GartanEntity):
     @property
     def available(self) -> bool:
         return super().available and self.app is not None
+
+
+class HistoryListenerMixin:
+    """Also refresh when the history ledger changes (listed before the base)."""
+
+    async def async_added_to_hass(self) -> None:
+        await super().async_added_to_hass()
+        self.async_on_remove(
+            self.coordinator.history.async_add_listener(self.async_write_ha_state)
+        )

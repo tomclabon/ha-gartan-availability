@@ -234,3 +234,66 @@ class ClientTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class RenderTests(unittest.TestCase):
+    def setUp(self):
+        try:
+            import PIL  # noqa: F401
+        except ImportError:
+            self.skipTest("Pillow not installed")
+
+    def test_png_renders(self):
+        from custom_components.gartan_availability.core.render import RenderInput, render_week_png
+
+        days = [day_for(crew(me_cells="on"), d=DAY + timedelta(days=k)) for k in range(7)]
+        view = build_view(days, CFG, {}, NOW)
+        png = render_week_png(RenderInput(view, "KT52P1", TZ, NOW, {d.date: NOW for d in days}))
+        self.assertTrue(png.startswith(b"\x89PNG"))
+        stale = render_week_png(RenderInput(view, "NOPE", TZ, NOW, {}))
+        self.assertTrue(stale.startswith(b"\x89PNG"))
+
+    def test_slot_colours(self):
+        from custom_components.gartan_availability.core import render as R
+
+        self.assertEqual(R.slot_colour("available", True), R.BOTH)
+        self.assertEqual(R.slot_colour("alternate", False), R.APP_ONLY)
+        self.assertEqual(R.slot_colour("off_the_run", True), R.ME_ONLY)
+        self.assertEqual(R.slot_colour("off_the_run", False), R.NOTHING)
+        self.assertEqual(R.slot_colour("off_station", True), R.OUT)
+        self.assertEqual(R.slot_colour("unknown", False), R.NO_DATA)
+
+
+class CrewTests(unittest.TestCase):
+    def test_display_name(self):
+        from custom_components.gartan_availability.core.render import display_name
+
+        self.assertEqual(display_name("JIMENEZ-WILLIAMS, O", False), "O Jimenez-Williams")
+        self.assertEqual(display_name("SIMON WARD", True), "Simon Ward (import)")
+
+    def test_rows_sorted_by_next_change(self):
+        from custom_components.gartan_availability.core.render import crew_rows
+
+        people = [
+            dict(name="CLABON, T", skills=["BA"], cells=window("09:00", "12:00", "on", "off"), mine=True),
+            dict(name="ALPHA, A", skills=["IC1"], cells=window("00:00", "10:00", "on", "off")),
+            dict(name="BRAVO, B", skills=[], cells=window("11:00", "13:00", "on", "off")),
+            dict(name="CHARLIE, C", skills=[], cells=window("09:30", "12:00", "on", "off")),
+            dict(name="DELTA, D", skills=[], cells="off"),
+        ]
+        rows = crew_rows(view_for(people), NOW)  # 08:00
+        on = [(r.name, r.change.hour) for r in rows if r.on]
+        off = [(r.name, r.change.hour if r.change else None) for r in rows if not r.on]
+        self.assertEqual(on, [("A Alpha", 10)])
+        self.assertEqual(off, [("T Clabon", 9), ("C Charlie", 9), ("B Bravo", 11), ("D Delta", None)])
+        self.assertTrue(next(r for r in rows if r.name == "T Clabon").me)
+
+    def test_crew_png(self):
+        try:
+            import PIL  # noqa: F401
+        except ImportError:
+            self.skipTest("Pillow not installed")
+        from custom_components.gartan_availability.core.render import RenderInput, render_crew_png
+
+        png = render_crew_png(RenderInput(view_for(crew()), "", TZ, NOW, {DAY: NOW}))
+        self.assertTrue(png.startswith(b"\x89PNG"))

@@ -8,7 +8,8 @@ from homeassistant.core import HomeAssistant
 from homeassistant.util import dt as dt_util
 
 from .coordinator import selected_appliances
-from .entity import ApplianceEntity, GartanEntity, appliance_runs, me_runs, shout_span
+from .core.history import all_callouts
+from .entity import ApplianceEntity, GartanEntity, HistoryListenerMixin, appliance_runs, me_runs
 
 
 async def async_setup_entry(hass: HomeAssistant, entry, async_add_entities) -> None:
@@ -39,18 +40,35 @@ class _EventsMixin(CalendarEntity):
         return [e for e in self._events() if e.end > start_date and e.start < end_date]
 
 
-class OnCallCalendar(GartanEntity, _EventsMixin):
+def _callouts(entity):
+    return all_callouts(entity.coordinator.history.ledger, entity.view, dt_util.utcnow())
+
+
+class OnCallCalendar(HistoryListenerMixin, GartanEntity, _EventsMixin):
+    """Your on-call periods (current week), plus past call-outs you were on call for."""
+
     def __init__(self, coordinator) -> None:
         super().__init__(coordinator, "on_call", "On call")
 
     def _events(self) -> list[CalendarEvent]:
-        return [
+        events = [
             CalendarEvent(start=s, end=e, summary="On call", uid=f"{self.unique_id}_{s.isoformat()}")
             for s, e in me_runs(self.view)
         ]
+        wanted = set(selected_appliances(self.coordinator.config_entry))
+        for c in _callouts(self):
+            if c.me and c.appliance in wanted:
+                crew = f" ({c.crew} crew)" if c.crew else ""
+                events.append(
+                    CalendarEvent(
+                        start=c.start, end=c.end, summary=f"Call-out {c.appliance}{crew}",
+                        uid=f"{self.unique_id}_co_{c.appliance}_{c.start.isoformat()}",
+                    )
+                )
+        return sorted(events, key=lambda ev: ev.start)
 
 
-class ApplianceCalendar(ApplianceEntity, _EventsMixin):
+class ApplianceCalendar(HistoryListenerMixin, ApplianceEntity, _EventsMixin):
     def __init__(self, coordinator, label: str) -> None:
         # name None: takes the device name -> calendar.gartan_availability_<label>
         super().__init__(coordinator, label, "calendar", None)
@@ -67,12 +85,13 @@ class ApplianceCalendar(ApplianceEntity, _EventsMixin):
             )
             for s, e in appliance_runs(app, view)
         ]
-        span = shout_span(app, view)
-        if span:
-            events.append(
-                CalendarEvent(
-                    start=span[0], end=span[1], summary=f"{self.label} out on a call",
-                    uid=f"{self.unique_id}_out_{span[0].isoformat()}",
+        for c in _callouts(self):
+            if c.appliance == self.label:
+                crew = f" ({c.crew} crew)" if c.crew else ""
+                events.append(
+                    CalendarEvent(
+                        start=c.start, end=c.end, summary=f"{self.label} out on a call{crew}",
+                        uid=f"{self.unique_id}_out_{c.start.isoformat()}",
+                    )
                 )
-            )
         return sorted(events, key=lambda ev: ev.start)

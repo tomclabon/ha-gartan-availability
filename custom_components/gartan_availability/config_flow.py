@@ -29,7 +29,10 @@ from .const import (
     CONF_BASE_URL,
     CONF_BRIGADE_ID,
     CONF_BRIGADE_NAME,
+    CONF_EBID,
+    CONF_HISTORY_YEARS,
     CONF_ME,
+    DEFAULT_HISTORY_YEARS,
     DOMAIN,
 )
 from .core.client import AuthError, FetchError, GartanClient
@@ -232,6 +235,10 @@ class GartanOptionsFlow(config_entries.OptionsFlow):
                     labels, multiple=True
                 ),
                 vol.Optional(CONF_ME, description={"suggested_value": cur(CONF_ME, "")}): str,
+                vol.Required(
+                    CONF_HISTORY_YEARS, default=cur(CONF_HISTORY_YEARS, DEFAULT_HISTORY_YEARS)
+                ): vol.All(vol.Coerce(int), vol.Range(min=0, max=10)),
+                vol.Optional(CONF_EBID, description={"suggested_value": cur(CONF_EBID, None)}): vol.Coerce(int),
             }
         )
         return self.async_show_form(step_id="init", data_schema=schema)

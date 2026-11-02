@@ -40,6 +40,7 @@ lower case, e.g. `kt52p1`. You can rename any entity in the UI.
 | `sensor.gartan_availability_next_on_call` / `sensor.gartan_availability_next_off_call` | Timestamps |
 | `sensor.gartan_availability_who_is_on` | Number of people on now; attribute `people` (name, imported, skills) |
 | `sensor.gartan_availability_schedule` | The whole known week (see below) |
+| `image.gartan_availability_crew` | Who is on now (until when) and off (from when), soonest change first |
 | `binary_sensor.gartan_availability_needs_attention` | Any issue (also raised in Settings > Repairs) |
 | `sensor.gartan_availability_last_scrape` | Diagnostic |
 
@@ -51,8 +52,105 @@ lower case, e.g. `kt52p1`. You can rename any entity in the UI.
 | `binary_sensor.gartan_availability_<appliance>_on_the_run` | On the run now; attribute `status` |
 | `binary_sensor.gartan_availability_<appliance>_deployed` | Out on a call (Off Station) now |
 | `sensor.gartan_availability_<appliance>_next_on_the_run` / `_next_off_the_run` | Timestamps; unknown while out on a call |
+| `image.gartan_availability_<appliance>_week` | Week-at-a-glance picture: the appliance and you, 7 days |
 
 "Next off" timestamps are unknown when a run reaches the end of the known 7 days.
+
+## History: hours against contract, and call-outs
+
+The integration keeps its own history ledger, rebuilt from Gartan. Your Home
+Assistant recorder history isn't needed.
+
+**Loading**
+- On first setup it loads, in the background and throttled (about one request
+  every 2.5 s):
+  - your weekly contract figures, two weeks per request
+  - then every past day, for call-outs and your on-call time
+- It goes back to when you started, up to the configured number of years
+  (default 5). About three years takes roughly 50 minutes, once.
+- Progress is saved as it goes. A restart resumes rather than starting again.
+- Every night at 03:30 the last 4 weeks and 14 days are re-fetched, to catch late
+  corrections.
+- **Rebuild history** (button) clears the ledger and loads it all again.
+- `sensor.gartan_availability_history` shows the progress.
+
+**Hours** (Gartan's weekly figures: contract, and actual in brackets)
+
+| Sensor | Actual vs contract over |
+|---|---|
+| `sensor.gartan_availability_hours_this_week` | Monday 00:00 to now (contract pro-rata) |
+| `sensor.gartan_availability_hours_last_4_weeks` | the previous 4 weeks plus this week so far |
+| `sensor.gartan_availability_hours_last_52_weeks` | the previous 52 weeks plus this week so far |
+| `sensor.gartan_availability_hours_since_start` | every week since you started plus this week so far |
+
+Each state is your actual on-call hours. The attributes are `contract`,
+`difference`, `under_contract` and `complete`; `complete` is false while history
+is still loading. This week also has `week_contract` and `week_scheduled`, Gartan's
+figures for the whole week.
+
+**Call-outs**
+- A run of Off Station slots on an appliance counts as one call-out. You count as
+  on it if you were on call when it started; Gartan doesn't record who rode.
+- Per appliance there are `sensor.gartan_availability_<appliance>_call_outs_<period>`
+  and `..._my_call_outs_<period>`, for the same four periods.
+- Past call-outs appear on the appliance calendar ("out on a call"). The ones you
+  were on call for also appear on `calendar.gartan_availability_on_call` as
+  "Call-out <appliance>".
+
+**Long-term statistics.** For the Statistics graph card, the ledger is also
+written to these statistics (`b<id>` is your brigade id):
+- `gartan_availability:b<id>_on_call_hours` (daily)
+- `..._contract_hours` and `..._actual_hours` (weekly)
+- `..._<appliance>_call_outs` and `..._<appliance>_my_call_outs` (daily)
+
+**Options**
+- Years of history to load (0 turns it off).
+- Your employee id for the two-week view. It's normally read from the schedule,
+  so only set it if `sensor.gartan_availability_history` says it's missing.
+
+## Home-screen widget
+
+`image.gartan_availability_<appliance>_week` draws 7 rows (today plus 6 days), each
+a single bar across 00-24 with a faint grey mark every hour, coloured by slot:
+
+| Colour | Meaning |
+|---|---|
+| Green | Appliance on the run and you on call |
+| Blue | Appliance on, you not |
+| Amber | You on, appliance not |
+| Pink | Appliance out on a call |
+| Dark grey | Neither |
+| Light grey | Appliance status unknown, or no data |
+
+Today's past hours are dimmed and a thick white line marks now. The header shows
+"Updated HH:MM", which is when the picture was drawn. If today's data hasn't been
+fetched for 15 minutes, it shows "Data HH:MM" in red instead. Under each day label,
+"Updated HH:MM" shows that day's last fetch. Today is refreshed every 5 minutes and
+the other days about hourly; a time turns red once it's over 15 minutes old for
+today or 2 hours old for other days.
+
+`image.gartan_availability_crew` lists who is on now with when they go off, and who
+is off with when they come on, each sorted by soonest change. You're shown in amber,
+imported rows are marked "(import)", skills are shown small after each name, and
+changes within the hour are highlighted. "beyond week" means on past the known
+7 days; "not this week" means not on at all in that time.
+
+On Android, add the Home Assistant app's **Picture** widget and pick that entity.
+The picture is drawn fresh each time it's fetched. The widget fetches about hourly
+and whenever you tap it (set the tap action to Refresh).
+
+## Notifications blueprint
+
+`blueprints/automation/gartan_availability/heads_up.yaml` sends:
+- "On call in 15 minutes", with when you come off and whether the appliance is on
+  then (or out on a call)
+- "<Appliance> on in 15 minutes", only if you'll be on call then and it isn't out on
+  a call
+- an alert when the integration has needed attention for 10 minutes
+
+Import it via Settings > Automations & scenes > Blueprints > Import blueprint, using
+the file's GitHub URL. Then create an automation from it and pick the calendars,
+sensors and phone.
 
 ## Using the schedule sensor
 
@@ -97,10 +195,26 @@ While an appliance is out on a call, Gartan marks every future slot Off Station.
 The integration replaces those future slots with the last schedule seen before the
 call-out (kept in `.storage`), so the export and calendars stay useful.
 
+## Refresh settings
+
+These are on the **Gartan Availability** device page, under Configuration. Changes
+apply immediately with no reload, survive restarts, and can be set from
+automations (for example, faster polling while the appliance is out):
+
+| Setting | Default | Range | What it does |
+|---|---|---|---|
+| Today refresh | 5 min | 2–60 min | How often today's schedule is fetched |
+| Week refresh | 60 min | 15–360 min | How often the other 6 days are fetched (checked at each today refresh) |
+| History request gap | 2.5 s | 1–60 s | Pause between history requests |
+
+The "stale" warnings (attention sensor, red times on the images) scale with these:
+today is stale after 3 × Today refresh (at least 15 min), and other days after
+2 × Week refresh (at least 2 h).
+
 ## Behaviour
 
-- Fetches today every 5 minutes and the full 7 days roughly hourly, at 15-minute
-  resolution.
+- Fetches today every 5 minutes and the full 7 days hourly, at 15-minute resolution
+  (see Refresh settings).
 - Appliance status comes from the appliance cell's title. Only Available, Alternate,
   Off the Run and Off Station have been seen. Anything else counts as not on the run
   and raises an attention issue with the exact text.

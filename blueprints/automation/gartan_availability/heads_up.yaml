@@ -1,0 +1,187 @@
+blueprint:
+  name: Gartan Availability - heads-up notifications
+  description: >
+    Notifies a phone shortly before you come on call, and shortly before an
+    appliance comes on the run while you'll be on call (not while it's out on a
+    call). Each message says how long the period lasts and what the other
+    calendar is doing at that moment. Also alerts when the integration has
+    needed attention for 10 minutes.
+  domain: automation
+  source_url: https://github.com/REPLACE_ME/ha-gartan-availability/blob/main/blueprints/automation/gartan_availability/heads_up.yaml
+  input:
+    on_call_calendar:
+      name: Your on-call calendar
+      description: e.g. calendar.gartan_availability_on_call
+      selector:
+        entity:
+          filter:
+            integration: gartan_availability
+            domain: calendar
+    appliance_calendar:
+      name: Appliance calendar
+      description: e.g. calendar.gartan_availability_kt52p1
+      selector:
+        entity:
+          filter:
+            integration: gartan_availability
+            domain: calendar
+    appliance_deployed:
+      name: Appliance deployed sensor
+      description: e.g. binary_sensor.gartan_availability_kt52p1_deployed
+      selector:
+        entity:
+          filter:
+            integration: gartan_availability
+            domain: binary_sensor
+    needs_attention:
+      name: Needs attention sensor
+      description: binary_sensor.gartan_availability_needs_attention
+      selector:
+        entity:
+          filter:
+            integration: gartan_availability
+            domain: binary_sensor
+    appliance_name:
+      name: Appliance name used in messages
+      default: Truck
+      selector:
+        text:
+    notify_device:
+      name: Phone to notify
+      selector:
+        device:
+          filter:
+            integration: mobile_app
+    lead:
+      name: How long before
+      description: Negative offset, format -H:MM:SS
+      default: "-0:15:00"
+      selector:
+        text:
+
+mode: queued
+
+triggers:
+  - trigger: calendar
+    event: start
+    entity_id: !input on_call_calendar
+    offset: !input lead
+    id: me
+  - trigger: calendar
+    event: start
+    entity_id: !input appliance_calendar
+    offset: !input lead
+    id: appliance
+  - trigger: state
+    entity_id: !input needs_attention
+    to: "on"
+    for: "00:10:00"
+    id: attention
+
+variables:
+  me_cal: !input on_call_calendar
+  app_cal: !input appliance_calendar
+  deployed_sensor: !input appliance_deployed
+  attention_sensor: !input needs_attention
+  app_name: !input appliance_name
+
+actions:
+  - if:
+      - condition: trigger
+        id: attention
+    then:
+      - domain: mobile_app
+        type: notify
+        device_id: !input notify_device
+        title: Gartan Availability needs attention
+        message: >
+          {{ (state_attr(attention_sensor, 'issues') or {}).values() | join('; ')
+             or 'See Settings > Repairs' }}
+      - stop: Attention notified
+
+  # The moment the period starts, and the state of both calendars at that moment.
+  - variables:
+      at: "{{ trigger.calendar_event.start }}"
+      horizon: "{{ (today_at('00:00') + timedelta(days=7)).isoformat() }}"
+  - action: calendar.get_events
+    target:
+      entity_id: "{{ [me_cal, app_cal] }}"
+    data:
+      start_date_time: "{{ at }}"
+      duration:
+        days: 8
+    response_variable: cal
+  - variables:
+      # {'on': bool, 'until': iso} for each calendar at `at`. 'until' is the end
+      # of the covering event if on, else the start of the next one.
+      app_at: >
+        {% set t = as_datetime(at) %}
+        {% set ns = namespace(cover=none, nxt=none) %}
+        {% for e in cal[app_cal].events if e.summary is search('on the run$') %}
+          {% set s = as_datetime(e.start) %}{% set en = as_datetime(e.end) %}
+          {% if s <= t < en %}{% set ns.cover = e.end %}
+          {% elif s > t and (ns.nxt is none or s < as_datetime(ns.nxt)) %}{% set ns.nxt = e.start %}{% endif %}
+        {% endfor %}
+        {{ {'on': ns.cover is not none, 'until': ns.cover if ns.cover is not none else ns.nxt} }}
+      me_at: >
+        {% set t = as_datetime(at) %}
+        {% set ns = namespace(cover=none, nxt=none) %}
+        {% for e in cal[me_cal].events if e.summary == 'On call' %}
+          {% set s = as_datetime(e.start) %}{% set en = as_datetime(e.end) %}
+          {% if s <= t < en %}{% set ns.cover = e.end %}
+          {% elif s > t and (ns.nxt is none or s < as_datetime(ns.nxt)) %}{% set ns.nxt = e.start %}{% endif %}
+        {% endfor %}
+        {{ {'on': ns.cover is not none, 'until': ns.cover if ns.cover is not none else ns.nxt} }}
+      minutes: "{{ ((as_datetime(at) - now()).total_seconds() / 60) | round(0) | int }}"
+
+  - if:
+      - condition: trigger
+        id: me
+    then:
+      # the on-call calendar also shows past call-outs; only on-call periods count
+      - condition: template
+        value_template: "{{ trigger.calendar_event.summary == 'On call' }}"
+      - domain: mobile_app
+        type: notify
+        device_id: !input notify_device
+        title: "On call in {{ minutes }} minutes"
+        message: >
+          {%- macro when(iso) -%}
+            {%- if not iso -%}unknown
+            {%- else -%}
+              {%- set d = as_local(as_datetime(iso)) -%}{%- set h = as_datetime(horizon) -%}
+              {%- if d >= h -%}at least {{ as_local(h).strftime('%a %H:%M') }}
+              {%- elif d.date() == now().date() -%}{{ d.strftime('%H:%M') }}
+              {%- else -%}{{ d.strftime('%a %H:%M') }}{%- endif -%}
+            {%- endif -%}
+          {%- endmacro -%}
+          Until {{ when(trigger.calendar_event.end) }}.
+          {% if is_state(deployed_sensor, 'on') -%}
+            {{ app_name }} out on a call.
+          {%- elif app_at.on -%}
+            {{ app_name }} ON until {{ when(app_at.until) }}.
+          {%- else -%}
+            {{ app_name }} OFF until {{ when(app_at.until) }}.
+          {%- endif %}
+    else:
+      # appliance trigger: only on-the-run periods, while you'll be on call,
+      # and not while it's out
+      - condition: template
+        value_template: >
+          {{ trigger.calendar_event.summary is search('on the run$')
+             and me_at.on and not is_state(deployed_sensor, 'on') }}
+      - domain: mobile_app
+        type: notify
+        device_id: !input notify_device
+        title: "{{ app_name }} on in {{ minutes }} minutes"
+        message: >
+          {%- macro when(iso) -%}
+            {%- if not iso -%}unknown
+            {%- else -%}
+              {%- set d = as_local(as_datetime(iso)) -%}{%- set h = as_datetime(horizon) -%}
+              {%- if d >= h -%}at least {{ as_local(h).strftime('%a %H:%M') }}
+              {%- elif d.date() == now().date() -%}{{ d.strftime('%H:%M') }}
+              {%- else -%}{{ d.strftime('%a %H:%M') }}{%- endif -%}
+            {%- endif -%}
+          {%- endmacro -%}
+          Until {{ when(trigger.calendar_event.end) }}. On call until {{ when(me_at.until) }}.

@@ -103,6 +103,7 @@ class PersonDay:
     on: list[bool]
     bookable: list[bool]
     is_me: bool = False  # the logged-in user's row: its cells have "emp_" ids
+    ebid: int | None = None  # employee-brigade id (data-ebid), if the page shows it
 
 
 @dataclass
@@ -112,11 +113,13 @@ class DaySchedule:
     people: list[PersonDay]
     appliances: dict[str, list[str]]  # row label -> status per slot
     issues: dict[str, str] = field(default_factory=dict)  # key -> detail
+    appliance_crew: dict[str, list[int | None]] = field(default_factory=dict)  # "(4)" per slot
 
 
 _PERSON_ID = re.compile(r"^emp(RO)?_(\d+)-(\d+)$")
 _APP_ID = re.compile(r"^app_(\d+)_(\d+)$")
 _STATUS_TEXT = re.compile(r"\)\s*(.+?)\s*$")
+_CREW = re.compile(r"\((\d+)\)")
 
 
 def _is_red(colour: str) -> bool:
@@ -175,6 +178,7 @@ def parse_day(html: str, day: date, tz: tzinfo) -> DaySchedule:
     after_divider = False
     raw_people: list[tuple[Row, bool]] = []
     app_rows: dict[str, dict[int, str]] = {}
+    app_crew: dict[str, dict[int, int]] = {}
     for row in parser.rows:
         classes = set(row.attrs.get("class", "").split())
         if "importDivider" in classes:
@@ -184,16 +188,22 @@ def parse_day(html: str, day: date, tz: tzinfo) -> DaySchedule:
             raw_people.append((row, after_divider))
             continue
         statuses: dict[int, str] = {}
+        crew: dict[int, int] = {}
         label = ""
         for c in row.cells:
             m = _APP_ID.match(c.attrs.get("id", ""))
             if m:
                 title = c.attrs.get("title", "")
                 statuses[int(m.group(2))] = title
+                cm = _CREW.search(c.text)
+                if cm:
+                    crew[int(m.group(2))] = int(cm.group(1))
                 # titles look like "KT52P1 (0000 - 0015) Available"
                 label = label or title.split(" (", 1)[0].strip()
         if statuses:
-            app_rows[label or (row.cells[0].text if row.cells else "")] = statuses
+            key = label or (row.cells[0].text if row.cells else "")
+            app_rows[key] = statuses
+            app_crew[key] = crew
 
     n = max((max(s) + 1 for s in app_rows.values()), default=0)
     gathered = []
@@ -216,12 +226,13 @@ def parse_day(html: str, day: date, tz: tzinfo) -> DaySchedule:
         if cells:
             n = max(n, max(cells) + 1)
         role = row.cells[0].attrs.get("data-role", "") if row.cells else ""
-        gathered.append((row.attrs["data-name"], role, skills, expiring, is_import, cells, editable))
+        ebid = next((c.attrs["data-ebid"] for c in row.cells if c.attrs.get("data-ebid", "").isdigit()), None)
+        gathered.append((row.attrs["data-name"], role, skills, expiring, is_import, cells, editable, ebid))
 
     issues: dict[str, str] = {}
     unknown: dict[str, str] = {}
     people: list[PersonDay] = []
-    for name, role, skills, expiring, is_import, cells, editable in gathered:
+    for name, role, skills, expiring, is_import, cells, editable, ebid in gathered:
         on: list[bool] = []
         bookable: list[bool] = []
         for i in range(n):
@@ -243,6 +254,7 @@ def parse_day(html: str, day: date, tz: tzinfo) -> DaySchedule:
                 on=on,
                 bookable=bookable,
                 is_me=editable and not is_import,
+                ebid=int(ebid) if ebid else None,
             )
         )
 
@@ -270,7 +282,10 @@ def parse_day(html: str, day: date, tz: tzinfo) -> DaySchedule:
         issues[f"status_{raw}"] = (
             f"Unknown appliance status {raw!r}; treated as not on the run"
         )
-    return DaySchedule(day, starts, people, appliances, issues)
+    crew_out = {
+        label: [app_crew.get(label, {}).get(i) for i in range(n)] for label in appliances
+    }
+    return DaySchedule(day, starts, people, appliances, issues, crew_out)
 
 
 # ---------------------------------------------------------------------------
@@ -334,4 +349,58 @@ def parse_brigades(html: str) -> list[Brigade]:
         if bid <= 0 or not text:
             continue
         out.append(Brigade(bid, text, "selected" in attrs))
+    return out
+
+
+# ---------------------------------------------------------------------------
+# employee view (GetEmployeeSchedule): weekly contract figures
+
+
+_CONTRACT = re.compile(r"(\d+(?:\.\d+)?)\s*\(\s*(\d+(?:\.\d+)?)\s*\)")
+
+
+@dataclass(frozen=True)
+class WeekHours:
+    monday: date
+    contract: float  # hours expected that week
+    actual: float  # hours available that week (Gartan's bracketed figure)
+
+
+def parse_employee_weeks(html: str) -> dict[date, WeekHours]:
+    """Rows carry data-date (dd/mm/yyyy) and a 'contractHrsColumn' cell
+    'CONTRACT (ACTUAL)', the same on every day of a Monday-Sunday week."""
+    parser = _TableParser()
+    parser.feed(html)
+    parser.close()
+    out: dict[date, WeekHours] = {}
+    for row in parser.rows:
+        raw = row.attrs.get("data-date", "")
+        try:
+            dd, mm, yy = (int(x) for x in raw.split("/"))
+            d = date(yy, mm, dd)
+        except ValueError:
+            continue
+        cell = next((c for c in row.cells if "contractHrsColumn" in c.attrs.get("class", "")), None)
+        if cell is None:
+            continue
+        m = _CONTRACT.search(cell.text)
+        if not m:
+            continue
+        monday = d - timedelta(days=d.weekday())
+        out[monday] = WeekHours(monday, float(m.group(1)), float(m.group(2)))
+    return out
+
+
+def employee_rows_dates(html: str) -> list[date]:
+    """Dates present in an employee view (to tell 'no data' from 'no rows')."""
+    parser = _TableParser()
+    parser.feed(html)
+    parser.close()
+    out = []
+    for row in parser.rows:
+        try:
+            dd, mm, yy = (int(x) for x in row.attrs.get("data-date", "").split("/"))
+            out.append(date(yy, mm, dd))
+        except ValueError:
+            continue
     return out

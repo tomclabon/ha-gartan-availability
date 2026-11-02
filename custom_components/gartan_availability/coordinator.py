@@ -26,6 +26,7 @@ from .const import (
     MAX_CAPTURES,
     STALE_AFTER,
     TODAY_INTERVAL,
+    TODAY_STALE_AFTER,
     WEEK_DAYS,
     WEEK_INTERVAL,
 )
@@ -66,6 +67,7 @@ class GartanCoordinator(DataUpdateCoordinator[View]):
             entry.data[CONF_BRIGADE_ID],
             entry.data[CONF_BRIGADE_NAME],
         )
+        self.client = self._client  # shared with the history loader (requests are serialised)
         self._store: Store = Store(hass, 2, f"{DOMAIN}.{entry.entry_id}")
         self._days: dict[date, DaySchedule] = {}
         self._raw: dict[date, str] = {}
@@ -73,7 +75,9 @@ class GartanCoordinator(DataUpdateCoordinator[View]):
         self._baseline: dict[str, dict[str, str]] = {}
         self._captured: set[str] = set()
         self._issue_ids: set[str] = set()
+        self.week_interval: timedelta = WEEK_INTERVAL
         self.last_success: datetime | None = None
+        self.fetched_at: dict[date, datetime] = {}  # last successful fetch per day
         self.last_error: str | None = None
         self.known_appliances: list[str] = []
         self._unsub_tick = async_track_time_change(
@@ -101,9 +105,25 @@ class GartanCoordinator(DataUpdateCoordinator[View]):
         if self.data is not None:
             self.async_update_listeners()
 
+    # -- runtime settings (number entities) -------------------------------
+    @property
+    def today_stale_after(self) -> timedelta:
+        return max(TODAY_STALE_AFTER, 3 * (self.update_interval or TODAY_INTERVAL))
+
+    @property
+    def day_stale_after(self) -> timedelta:
+        return max(STALE_AFTER, 2 * self.week_interval)
+
+    async def async_set_today_interval(self, minutes: float) -> None:
+        self.update_interval = timedelta(minutes=minutes)
+        await self.async_request_refresh()  # reschedules with the new interval
+
+    def set_week_interval(self, minutes: float) -> None:
+        self.week_interval = timedelta(minutes=minutes)
+
     # -- fetching ----------------------------------------------------------
     def _week_due(self, today: date) -> bool:
-        if self._week_at is None or dt_util.utcnow() - self._week_at >= WEEK_INTERVAL:
+        if self._week_at is None or dt_util.utcnow() - self._week_at >= self.week_interval - timedelta(seconds=30):
             return True
         return any(today + timedelta(days=i) not in self._days for i in range(WEEK_DAYS))
 
@@ -126,6 +146,7 @@ class GartanCoordinator(DataUpdateCoordinator[View]):
                 failed.append(f"{day}: {err}")
                 continue
             self._raw[day] = html
+            self.fetched_at[day] = now
             self._days[day] = await self.hass.async_add_executor_job(
                 parse_day, html, day, tz
             )
@@ -134,6 +155,7 @@ class GartanCoordinator(DataUpdateCoordinator[View]):
         for stale in [d for d in self._days if d < today]:
             self._days.pop(stale, None)
             self._raw.pop(stale, None)
+            self.fetched_at.pop(stale, None)
 
         if failed:
             self.last_error = "; ".join(failed)
@@ -164,7 +186,7 @@ class GartanCoordinator(DataUpdateCoordinator[View]):
         out = dict(view.issues) if view else {}
         if self.last_error:
             out["fetch_error"] = self.last_error
-        if self.last_success and now - self.last_success > STALE_AFTER:
+        if self.last_success and now - self.last_success > self.day_stale_after:
             out["stale"] = f"No successful fetch since {self.last_success.isoformat()}"
         return out
 

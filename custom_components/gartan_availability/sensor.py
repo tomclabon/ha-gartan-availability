@@ -4,13 +4,28 @@ from __future__ import annotations
 from datetime import datetime
 
 from homeassistant.components.sensor import SensorDeviceClass, SensorEntity
-from homeassistant.const import EntityCategory
+from homeassistant.const import EntityCategory, UnitOfTime
 from homeassistant.util import dt as dt_util
 
 from .coordinator import selected_appliances
 from .core.model import next_on_off
 from .core.view import people_on, schedule_export
-from .entity import ApplianceEntity, GartanEntity, appliance_runs, me_runs, status_now
+from .core.history import PERIODS, all_callouts, callout_counts, hours_summary
+from .entity import (
+    ApplianceEntity,
+    GartanEntity,
+    HistoryListenerMixin,
+    appliance_runs,
+    me_runs,
+    status_now,
+)
+
+PERIOD_NAMES = {
+    "this_week": "this week",
+    "last_4_weeks": "last 4 weeks",
+    "last_52_weeks": "last 52 weeks",
+    "since_start": "since start",
+}
 from .core.const import STATUS_OFF_STATION
 
 
@@ -22,12 +37,15 @@ async def async_setup_entry(hass, entry, async_add_entities) -> None:
         WhoIsOn(c),
         Schedule(c),
         LastScrape(c),
+        HistoryStatus(c),
     ]
+    entities += [Hours(c, period) for period in PERIODS]
     for label in selected_appliances(entry):
         entities += [
             ApplianceNext(c, label, "next_on_the_run", "Next on the run", True),
             ApplianceNext(c, label, "next_off_the_run", "Next off the run", False),
         ]
+        entities += [CallOuts(c, label, period, mine) for period in PERIODS for mine in (False, True)]
     async_add_entities(entities)
 
 
@@ -113,3 +131,90 @@ class LastScrape(GartanEntity, SensorEntity):
     @property
     def native_value(self) -> datetime | None:
         return self.coordinator.last_success
+
+
+class Hours(HistoryListenerMixin, GartanEntity, SensorEntity):
+    """Your on-call hours against contract for a Gartan-week period.
+    State: actual hours. "This week" counts only the part already passed, and
+    its contract is pro-rata; the longer periods add that to whole past weeks."""
+
+    _attr_device_class = SensorDeviceClass.DURATION
+    _attr_native_unit_of_measurement = UnitOfTime.HOURS
+    _attr_suggested_display_precision = 1
+    _attr_icon = "mdi:clock-check-outline"
+
+    def __init__(self, coordinator, period: str) -> None:
+        super().__init__(coordinator, f"hours_{period}", f"Hours {PERIOD_NAMES[period]}")
+        self._period = period
+
+    def _summary(self):
+        tz = dt_util.get_default_time_zone()
+        return hours_summary(self.coordinator.history.ledger, self.view, dt_util.utcnow(), tz)[self._period]
+
+    @property
+    def native_value(self) -> float:
+        return self._summary().actual
+
+    @property
+    def extra_state_attributes(self) -> dict:
+        s = self._summary()
+        attrs = {
+            "contract": s.contract,
+            "difference": s.difference,
+            "under_contract": s.actual < s.contract,
+            "past_weeks": s.weeks,
+            "complete": s.complete,
+        }
+        if self._period == "this_week":
+            from datetime import timedelta
+
+            today = dt_util.now().date()
+            week = self.coordinator.history.ledger.weeks.get(today - timedelta(days=today.weekday()))
+            attrs["week_contract"] = week.contract if week else None
+            attrs["week_scheduled"] = week.actual if week else None
+        return attrs
+
+
+class CallOuts(HistoryListenerMixin, ApplianceEntity, SensorEntity):
+    """Number of call-outs for the appliance (or the ones you were on call for)."""
+
+    _attr_native_unit_of_measurement = "call-outs"
+    _attr_icon = "mdi:fire-truck"
+
+    def __init__(self, coordinator, label: str, period: str, mine: bool) -> None:
+        name = f"{'My call-outs' if mine else 'Call-outs'} {PERIOD_NAMES[period]}"
+        key = f"{'my_' if mine else ''}call_outs_{period}"
+        super().__init__(coordinator, label, key, name)
+        self._period, self._mine = period, mine
+
+    @property
+    def available(self) -> bool:
+        return self.coordinator.last_update_success  # history counts even if the row moves
+
+    @property
+    def native_value(self) -> int:
+        now = dt_util.utcnow()
+        tz = dt_util.get_default_time_zone()
+        led = self.coordinator.history.ledger
+        counts = callout_counts(all_callouts(led, self.view, now), led, self.label, now, tz)
+        return counts[self._period]["me" if self._mine else "all"]
+
+
+class HistoryStatus(HistoryListenerMixin, GartanEntity, SensorEntity):
+    _attr_entity_category = EntityCategory.DIAGNOSTIC
+    _attr_icon = "mdi:history"
+
+    def __init__(self, coordinator) -> None:
+        super().__init__(coordinator, "history", "History")
+
+    @property
+    def available(self) -> bool:
+        return True
+
+    @property
+    def native_value(self) -> str:
+        return self.coordinator.history.status
+
+    @property
+    def extra_state_attributes(self) -> dict:
+        return self.coordinator.history.progress()

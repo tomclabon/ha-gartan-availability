@@ -2,18 +2,23 @@
 HA-free core (and its tests) can be imported without Home Assistant installed."""
 from __future__ import annotations
 
-PLATFORMS = ["binary_sensor", "calendar", "sensor"]
+PLATFORMS = ["binary_sensor", "button", "calendar", "image", "number", "sensor"]
 
 
 async def async_setup_entry(hass, entry) -> bool:
     from .coordinator import GartanCoordinator
 
+    from .history_manager import HistoryManager
+
     coordinator = GartanCoordinator(hass, entry)
     await coordinator.async_load()
     await coordinator.async_config_entry_first_refresh()
+    coordinator.history = HistoryManager(hass, coordinator)
+    await coordinator.history.async_load()
     entry.runtime_data = coordinator
     entry.async_on_unload(entry.add_update_listener(_reload))
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
+    coordinator.history.start()
     return True
 
 
@@ -24,5 +29,6 @@ async def _reload(hass, entry) -> None:
 async def async_unload_entry(hass, entry) -> bool:
     ok = await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
     if ok:
+        entry.runtime_data.history.stop()
         entry.runtime_data.async_cleanup()
     return ok

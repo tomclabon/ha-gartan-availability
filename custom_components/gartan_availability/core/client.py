@@ -5,6 +5,7 @@ own (Home Assistant code passes a session with a dummy cookie jar).
 """
 from __future__ import annotations
 
+import asyncio
 import json
 from datetime import date
 from html.parser import HTMLParser
@@ -15,6 +16,7 @@ from .parse import Brigade, parse_brigades
 LOGIN_PATH = "/Availability/Account/Login.aspx"
 SCHEDULE_PAGE_PATH = "/Availability/Availability/Schedule/AvailabilityMain1.aspx"
 SCHEDULE_PATH = SCHEDULE_PAGE_PATH + "/GetSchedule"
+EMPLOYEE_PATH = SCHEDULE_PAGE_PATH + "/GetEmployeeSchedule"
 USER_FIELD = "txt_userid"
 PASSWORD_FIELD = "txt_pword"
 SUBMIT_FIELD = "btnLogin"
@@ -34,6 +36,24 @@ def build_request_body(day: date, brigade_id: int, brigade_name: str) -> dict:
         "showHours": True,
         "highlightContractDetails": False,
         "highlightEmployeesOffStation": True,
+        "includeApplianceStatus": True,
+        "showEmpShiftTypes": False,
+    }
+
+
+def build_employee_body(start: date, brigade_id: int, brigade_name: str, ebid: int, days: int) -> dict:
+    """Two-week view of one person (as the schedule page sends it)."""
+    return {
+        "brigadeId": brigade_id,
+        "brigadeName": brigade_name,
+        "employeeBrigadeId": ebid,
+        "bookingDate": f"{start:%d/%m/%Y}",
+        "resolution": 60,
+        "dayCount": days,
+        "showDetails": True,
+        "showHours": True,
+        "highlightContractDetails": False,
+        "highlightEmployeesOffStation": False,
         "includeApplianceStatus": True,
         "showEmpShiftTypes": False,
     }
@@ -97,6 +117,7 @@ class GartanClient:
         self._brigade_name = brigade_name
         self._cookies: dict[str, str] = {}
         self._logged_in = False
+        self._lock = asyncio.Lock()  # one request at a time (shared login)
 
     def _headers(self, extra: dict | None = None) -> dict:
         h = {"User-Agent": "gartan-availability-ha/0.1"}
@@ -143,6 +164,10 @@ class GartanClient:
 
     async def fetch_brigades(self) -> list[Brigade]:
         """The stations this login can see (the schedule page's station dropdown)."""
+        async with self._lock:
+            return await self._fetch_brigades()
+
+    async def _fetch_brigades(self) -> list[Brigade]:
         for _ in (1, 2):
             if not self._logged_in:
                 await self.login()
@@ -167,33 +192,47 @@ class GartanClient:
         raise FetchError("schedule page refused after a fresh login")
 
     async def fetch_day(self, day: date) -> str:
-        """Return the schedule HTML for one day (15-minute resolution)."""
+        """Return the station schedule HTML for one day (15-minute resolution)."""
         if self._brigade_id is None:
             raise FetchError("No station selected")
-        body = build_request_body(day, self._brigade_id, self._brigade_name)
-        for attempt in (1, 2):
-            if not self._logged_in:
-                await self.login()
-            try:
-                async with self._s.post(
-                    self._base + SCHEDULE_PATH,
-                    data=json.dumps(body),
-                    headers=self._headers(
-                        {"Content-Type": "application/json", "Accept": "application/json"}
-                    ),
-                    allow_redirects=False,
-                ) as r:
-                    status, text = r.status, await r.text()
-            except Exception as err:
-                raise FetchError(f"schedule request failed: {err}") from err
-            if status >= 500 or status == 404:
-                raise FetchError(f"schedule HTTP {status}: {text[:200]}")
-            if status < 300:
+        return await self._page_method(
+            SCHEDULE_PATH, build_request_body(day, self._brigade_id, self._brigade_name)
+        )
+
+    async def fetch_employee(self, start: date, ebid: int, days: int = 14) -> str:
+        """Return one person's schedule HTML for `days` days from `start`."""
+        if self._brigade_id is None:
+            raise FetchError("No station selected")
+        return await self._page_method(
+            EMPLOYEE_PATH,
+            build_employee_body(start, self._brigade_id, self._brigade_name, ebid, days),
+        )
+
+    async def _page_method(self, path: str, body: dict) -> str:
+        async with self._lock:
+            for _ in (1, 2):
+                if not self._logged_in:
+                    await self.login()
                 try:
-                    return json.loads(text)["d"]
-                except (ValueError, KeyError, TypeError):
-                    pass  # login page instead of JSON: session lapsed
-            self._logged_in = False
-        # Login succeeded but the schedule still refused us. Not a password problem,
-        # so don't trigger re-authentication; retry on the next poll.
-        raise FetchError("schedule refused after a fresh login")
+                    async with self._s.post(
+                        self._base + path,
+                        data=json.dumps(body),
+                        headers=self._headers(
+                            {"Content-Type": "application/json", "Accept": "application/json"}
+                        ),
+                        allow_redirects=False,
+                    ) as r:
+                        status, text = r.status, await r.text()
+                except Exception as err:
+                    raise FetchError(f"request failed: {err}") from err
+                if status >= 500 or status == 404:
+                    raise FetchError(f"HTTP {status}: {text[:200]}")
+                if status < 300:
+                    try:
+                        return json.loads(text)["d"]
+                    except (ValueError, KeyError, TypeError):
+                        pass  # login page instead of JSON: session lapsed
+                self._logged_in = False
+            # Login succeeded but the request still refused us. Not a password
+            # problem, so don't trigger re-authentication; retry later.
+            raise FetchError("refused after a fresh login")

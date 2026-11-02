@@ -20,6 +20,7 @@ class Series:
     skills: frozenset[str] = frozenset()  # from the first day the row appears
     expiring: frozenset[str] = frozenset()
     is_me: bool = False
+    ebid: int | None = None
 
 
 @dataclass
@@ -70,9 +71,10 @@ def build_timeline(days: Iterable[DaySchedule]) -> Timeline:
             if s is None:
                 s = series[key] = Series(
                     key, p.name, p.is_import, [False] * off, [False] * off,
-                    p.skills, p.expiring, p.is_me,
+                    p.skills, p.expiring, p.is_me, p.ebid,
                 )
             s.is_me = s.is_me or p.is_me
+            s.ebid = s.ebid or p.ebid
             if key in today:
                 on, book = today[key]
                 today[key] = (
